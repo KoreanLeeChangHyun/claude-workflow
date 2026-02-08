@@ -1,6 +1,7 @@
 # [제목] - 작업 보고서
 
 - 작업 ID: {{workId}}
+- 워크플로우: {{workflowId}}
 - 명령어: {{command}}
 - 작업명: {{workName}}
 - 작성일: {{date}} (KST)

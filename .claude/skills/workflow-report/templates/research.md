@@ -1,9 +1,10 @@
 # Research Report: [제목]
 
 - 작업 ID: {{workId}}
-- 명령어: {{command}}
-- 작성일: {{date}} (KST)
 - 워크플로우: {{workflowId}}
+- 명령어: {{command}}
+- 작업명: {{workName}}
+- 작성일: {{date}} (KST)
 - 원본 계획: {{planPath}}
 
 ## Executive Summary
