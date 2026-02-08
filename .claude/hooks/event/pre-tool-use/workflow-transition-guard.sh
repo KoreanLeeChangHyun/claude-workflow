@@ -1,0 +1,233 @@
+#!/bin/bash
+# 워크플로우 전이 가드 Hook 스크립트
+# PreToolUse(Bash) 이벤트에서 update-workflow-state.sh 또는 wf-state alias 호출의 phase 전이를 검증
+#
+# 입력: stdin으로 JSON (tool_name, tool_input)
+# 출력: 불법 전이 시 hookSpecificOutput JSON, 통과 시 빈 출력
+#
+# 합법 전이 테이블:
+#   NONE -> INIT
+#   INIT -> PLAN
+#   PLAN -> WORK, CANCELLED
+#   WORK -> REPORT, FAILED
+#   REPORT -> COMPLETED, FAILED
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+
+# 비상 우회 수단
+if [ "$WORKFLOW_SKIP_GUARD" = "1" ]; then
+    exit 0
+fi
+
+# Bypass 메커니즘: 파일 기반 또는 환경변수 기반
+if [ "$WORKFLOW_GUARD_DISABLE" = "1" ] || [ -f "$PROJECT_ROOT/.workflow/bypass" ]; then
+    exit 0
+fi
+
+# stdin에서 JSON 읽기
+INPUT=$(cat)
+
+# tool_name 확인 (Bash가 아니면 통과)
+TOOL_NAME=$(echo "$INPUT" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    print(data.get('tool_name', ''))
+except:
+    print('')
+" 2>/dev/null)
+
+if [ "$TOOL_NAME" != "Bash" ]; then
+    exit 0
+fi
+
+# command 필드 추출
+COMMAND=$(echo "$INPUT" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    tool_input = data.get('tool_input', {})
+    print(tool_input.get('command', ''))
+except:
+    print('')
+" 2>/dev/null)
+
+if [ -z "$COMMAND" ]; then
+    exit 0
+fi
+
+# update-workflow-state.sh 또는 wf-state alias 호출이 아니면 통과
+if ! echo "$COMMAND" | grep -qE 'update-workflow-state\.sh|wf-state' 2>/dev/null; then
+    exit 0
+fi
+
+# command 문자열에서 mode, workDir, fromPhase, toPhase 파싱
+# update-workflow-state.sh 또는 wf-state 호출 형식:
+#   status 모드: wf-state status <workDir> <fromPhase> <toPhase>
+#   both 모드:   wf-state both <workDir> <agent> <fromPhase> <toPhase>
+#   context 모드: wf-state context <workDir> <agent> (전이 검증 불필요)
+PARSED=$(echo "$COMMAND" | python3 -c "
+import sys, re
+
+cmd = sys.stdin.read().strip()
+
+# update-workflow-state.sh 또는 wf-state 이후의 모든 인자를 추출
+m = re.search(r'(?:update-workflow-state\.sh|wf-state)\s+(.+)', cmd)
+if not m:
+    print('')
+    sys.exit()
+
+args = m.group(1).split()
+mode = args[0] if len(args) > 0 else ''
+
+if mode == 'status' and len(args) >= 4:
+    # status <workDir> <fromPhase> <toPhase>
+    work_dir = args[1]
+    from_phase = args[2].upper()
+    to_phase = args[3].upper()
+    print(f'{work_dir}|{from_phase}|{to_phase}')
+elif mode == 'both' and len(args) >= 5:
+    # both <workDir> <agent> <fromPhase> <toPhase>
+    work_dir = args[1]
+    from_phase = args[3].upper()
+    to_phase = args[4].upper()
+    print(f'{work_dir}|{from_phase}|{to_phase}')
+else:
+    print('')
+" 2>/dev/null)
+
+if [ -z "$PARSED" ]; then
+    exit 0
+fi
+
+WORK_DIR=$(echo "$PARSED" | cut -d'|' -f1)
+FROM_PHASE=$(echo "$PARSED" | cut -d'|' -f2)
+TO_PHASE=$(echo "$PARSED" | cut -d'|' -f3)
+
+# YYYYMMDD-HHMMSS 단축 형식이면 registry.json에서 실제 workDir 해석
+if [[ "$WORK_DIR" =~ ^[0-9]{8}-[0-9]{6}$ ]]; then
+    REGISTRY_FILE="$PROJECT_ROOT/.workflow/registry.json"
+    if [ -f "$REGISTRY_FILE" ]; then
+        RESOLVED=$(WF_KEY="$WORK_DIR" WF_REGISTRY="$REGISTRY_FILE" python3 -c "
+import json, os, sys
+key = os.environ['WF_KEY']
+registry_file = os.environ['WF_REGISTRY']
+try:
+    with open(registry_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    if key in data and 'workDir' in data[key]:
+        print(data[key]['workDir'])
+    else:
+        print('')
+except:
+    print('')
+" 2>/dev/null)
+        if [ -n "$RESOLVED" ]; then
+            WORK_DIR="$RESOLVED"
+        else
+            # 레거시 폴백: .workflow/YYYYMMDD-HHMMSS (플랫 구조)
+            WORK_DIR=".workflow/$WORK_DIR"
+        fi
+    else
+        WORK_DIR=".workflow/$WORK_DIR"
+    fi
+fi
+
+# 상대 경로를 절대 경로로 변환
+if [[ "$WORK_DIR" != /* ]]; then
+    WORK_DIR="$PROJECT_ROOT/$WORK_DIR"
+fi
+
+# workDir의 status.json에서 현재 phase 읽기
+CURRENT_PHASE=""
+if [ -f "${WORK_DIR}/status.json" ]; then
+    CURRENT_PHASE=$(WORK_DIR_PATH="${WORK_DIR}" python3 -c "
+import json, os, sys
+try:
+    work_dir = os.environ['WORK_DIR_PATH']
+    with open(os.path.join(work_dir, 'status.json'), 'r') as f:
+        data = json.load(f)
+    print(data.get('phase', 'NONE').upper())
+except:
+    print('NONE')
+" 2>/dev/null)
+fi
+
+if [ -z "$CURRENT_PHASE" ]; then
+    CURRENT_PHASE="NONE"
+fi
+
+# 현재 phase와 fromPhase 일치 검증
+if [ "$CURRENT_PHASE" != "$FROM_PHASE" ]; then
+    GUARD_CURRENT_PHASE="${CURRENT_PHASE}" GUARD_FROM_PHASE="${FROM_PHASE}" python3 -c "
+import json, os
+cur = os.environ['GUARD_CURRENT_PHASE']
+frm = os.environ['GUARD_FROM_PHASE']
+result = {
+    'hookSpecificOutput': {
+        'hookEventName': 'PreToolUse',
+        'permissionDecision': 'deny',
+        'permissionDecisionReason': f'Phase 불일치: status.json의 현재 phase({cur})가 요청한 fromPhase({frm})와 다릅니다.'
+    }
+}
+print(json.dumps(result, ensure_ascii=False))
+" 2>/dev/null
+    exit 0
+fi
+
+# 합법 전이 테이블 검증
+VALID=$(GUARD_FROM_PHASE="${FROM_PHASE}" GUARD_TO_PHASE="${TO_PHASE}" python3 -c "
+import os
+ALLOWED = {
+    'NONE': ['INIT'],
+    'INIT': ['PLAN'],
+    'PLAN': ['WORK', 'CANCELLED'],
+    'WORK': ['REPORT', 'FAILED'],
+    'REPORT': ['COMPLETED', 'FAILED']
+}
+
+from_phase = os.environ['GUARD_FROM_PHASE']
+to_phase = os.environ['GUARD_TO_PHASE']
+
+allowed_targets = ALLOWED.get(from_phase, [])
+if to_phase in allowed_targets:
+    print('yes')
+else:
+    print('no')
+" 2>/dev/null)
+
+if [ "$VALID" = "no" ]; then
+    # 합법 전이 대상 목록 생성
+    ALLOWED_LIST=$(GUARD_FROM_PHASE="${FROM_PHASE}" python3 -c "
+import os
+ALLOWED = {
+    'NONE': ['INIT'],
+    'INIT': ['PLAN'],
+    'PLAN': ['WORK', 'CANCELLED'],
+    'WORK': ['REPORT', 'FAILED'],
+    'REPORT': ['COMPLETED', 'FAILED']
+}
+targets = ALLOWED.get(os.environ['GUARD_FROM_PHASE'], [])
+print(', '.join(targets) if targets else '없음')
+" 2>/dev/null)
+
+    GUARD_FROM_PHASE="${FROM_PHASE}" GUARD_TO_PHASE="${TO_PHASE}" GUARD_ALLOWED_LIST="${ALLOWED_LIST}" python3 -c "
+import json, os
+frm = os.environ['GUARD_FROM_PHASE']
+to = os.environ['GUARD_TO_PHASE']
+allowed = os.environ['GUARD_ALLOWED_LIST']
+result = {
+    'hookSpecificOutput': {
+        'hookEventName': 'PreToolUse',
+        'permissionDecision': 'deny',
+        'permissionDecisionReason': f'불법 전이: {frm}에서 {to}로 직접 전이할 수 없습니다. 허용된 전이 대상: {allowed}'
+    }
+}
+print(json.dumps(result, ensure_ascii=False))
+" 2>/dev/null
+    exit 0
+fi
+
+# 합법 전이 - 통과 (빈 출력)
+exit 0

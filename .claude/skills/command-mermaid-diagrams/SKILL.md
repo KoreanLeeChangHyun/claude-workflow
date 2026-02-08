@@ -1,0 +1,171 @@
+---
+name: mermaid-diagrams
+description: Create Mermaid diagrams including flowcharts, sequence diagrams, class diagrams, ER diagrams, state diagrams, Gantt charts, pie charts, and more. Use when users ask for diagrams, flowcharts, process flows, system architecture, data models, or any visual representation of relationships and workflows. Supports output as Mermaid code (.md), HTML preview, PNG, or SVG images.
+---
+
+# Mermaid Diagrams
+
+Mermaid를 사용하여 다양한 다이어그램을 생성합니다.
+
+## 사용 시기
+
+- 플로우차트, 시퀀스 다이어그램이 필요할 때
+- 클래스 다이어그램, ER 다이어그램을 그릴 때
+- 상태 다이어그램, 간트 차트가 필요할 때
+- 시스템 아키텍처를 시각화할 때
+- 데이터 모델을 표현할 때
+
+---
+
+## 지원 다이어그램 타입
+
+### 1. Flowchart (플로우차트)
+
+```mermaid
+flowchart TD
+    A[시작] --> B{조건}
+    B -->|Yes| C[처리1]
+    B -->|No| D[처리2]
+    C --> E[끝]
+    D --> E
+```
+
+**방향 옵션:**
+- `TD` / `TB` - 위에서 아래
+- `BT` - 아래에서 위
+- `LR` - 왼쪽에서 오른쪽
+- `RL` - 오른쪽에서 왼쪽
+
+### 2. Sequence Diagram (시퀀스 다이어그램)
+
+```mermaid
+sequenceDiagram
+    participant A as Client
+    participant B as Server
+    participant C as Database
+
+    A->>B: Request
+    B->>C: Query
+    C-->>B: Result
+    B-->>A: Response
+```
+
+### 3. Class Diagram (클래스 다이어그램)
+
+```mermaid
+classDiagram
+    class Animal {
+        +String name
+        +int age
+        +makeSound()
+    }
+    class Dog {
+        +bark()
+    }
+    Animal <|-- Dog
+```
+
+### 4. ER Diagram (엔티티 관계 다이어그램)
+
+```mermaid
+erDiagram
+    CUSTOMER ||--o{ ORDER : places
+    ORDER ||--|{ LINE-ITEM : contains
+    PRODUCT ||--o{ LINE-ITEM : includes
+```
+
+### 5. State Diagram (상태 다이어그램)
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Processing: start
+    Processing --> Success: complete
+    Processing --> Error: fail
+    Success --> [*]
+    Error --> Idle: retry
+```
+
+### 6. Gantt Chart (간트 차트)
+
+```mermaid
+gantt
+    title 프로젝트 일정
+    dateFormat YYYY-MM-DD
+    section 기획
+        요구사항 분석 :a1, 2024-01-01, 7d
+        설계 :a2, after a1, 5d
+    section 개발
+        구현 :b1, after a2, 14d
+        테스트 :b2, after b1, 7d
+```
+
+### 7. Pie Chart (파이 차트)
+
+```mermaid
+pie title 예산 분배
+    "개발" : 45
+    "마케팅" : 25
+    "운영" : 20
+    "기타" : 10
+```
+
+## 출력 형식
+
+- **Markdown (.md)**: Mermaid 코드 블록
+- **HTML**: 인터랙티브 프리뷰
+- **PNG**: 이미지 파일
+- **SVG**: 벡터 이미지
+
+## 변환 방법
+
+### CLI 도구 (mmdc)
+
+```bash
+# 설치
+npm install -g @mermaid-js/mermaid-cli
+
+# PNG 변환
+mmdc -i diagram.mmd -o diagram.png
+
+# SVG 변환
+mmdc -i diagram.mmd -o diagram.svg
+
+# 테마 적용
+mmdc -i diagram.mmd -o diagram.png -t dark
+```
+
+### HTML 임베드
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+</head>
+<body>
+    <div class="mermaid">
+        flowchart LR
+            A --> B
+    </div>
+    <script>mermaid.initialize({startOnLoad:true});</script>
+</body>
+</html>
+```
+
+## 스타일링
+
+```mermaid
+flowchart TD
+    A[시작]:::start --> B[처리]:::process
+    B --> C[끝]:::end
+
+    classDef start fill:#90EE90
+    classDef process fill:#87CEEB
+    classDef end fill:#FFB6C1
+```
+
+## 참고 링크
+
+- [Mermaid 공식 문서](https://mermaid.js.org/)
+- [Mermaid Live Editor](https://mermaid.live/)

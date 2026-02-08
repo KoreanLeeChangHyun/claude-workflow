@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(zsh:*)",
+      "Bash(sudo apt:*)",
+      "Bash(sudo apt install:*)"
+    ]
+  }
+}

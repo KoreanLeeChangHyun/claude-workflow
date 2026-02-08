@@ -1,0 +1,73 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "python3 .claude/scripts/statusline.py"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .claude/hooks/event/session-start/inject-workflow-orchestrator.py",
+            "statusMessage": "워크플로우 오케스트레이션 주입 중..."
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/event/pre-tool-use/slack-ask.sh",
+            "async": true,
+            "statusMessage": "Slack 알림 전송 중..."
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/event/pre-tool-use/dangerous-command-guard.sh",
+            "statusMessage": "위험 명령어 검사 중..."
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/event/pre-tool-use/tdd-guard.sh",
+            "statusMessage": "TDD 가드 검사 중..."
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/event/pre-tool-use/workflow-transition-guard.sh",
+            "statusMessage": "워크플로우 전이 검증 중..."
+          }
+        ]
+      },
+      {
+        "matcher": "Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/event/pre-tool-use/workflow-agent-guard.sh",
+            "statusMessage": "워크플로우 에이전트 검증 중..."
+          }
+        ]
+      }
+    ]
+  }
+}

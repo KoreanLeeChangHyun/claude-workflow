@@ -1,0 +1,10 @@
+
+# Workflow documents
+.workflow/
+
+# Claude Code environment (secrets only)
+.claude.env
+.claude.env*
+
+# Prompts and temps
+.prompt/
