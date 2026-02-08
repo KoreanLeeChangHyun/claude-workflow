@@ -132,56 +132,31 @@ workPath: <workDir>/work/
 
 ### 마크다운 보고서 템플릿
 
-```markdown
-# [보고서 제목]
+command별 보고서 구조가 다르므로, `templates/` 디렉토리에 유형별 템플릿을 분리하여 관리합니다.
 
-- 작성일: YYYY-MM-DD HH:MM:SS (KST)
-- 원본 계획: [계획 문서 링크 또는 경로]
+**템플릿 사용 절차:**
 
-## 요약
+1. command에 해당하는 템플릿 파일을 Read 도구로 로드
+2. `{{placeholder}}`를 실제 값으로 치환
+3. 작업 내역(`work/` 디렉터리)을 분석하여 각 섹션 작성
+4. `(선택)` 표기된 섹션은 해당 없으면 생략
 
-[1-3문장으로 전체 작업 결과 요약]
+**command별 템플릿 매핑:**
 
-**상태**: 완료 | 부분완료 | 실패
-**완료율**: X/Y 작업 (Z%)
+| command | 템플릿 파일 | 보고서 유형 |
+|---------|------------|------------|
+| implement | `templates/implement.md` | 코드 변경형 (문제-해결 구조) |
+| refactor | `templates/implement.md` | 코드 변경형 (개선 전/후 비교) |
+| build | `templates/implement.md` | 코드 변경형 (빌드 결과 중심) |
+| framework | `templates/implement.md` | 코드 변경형 (생성 구조 중심) |
+| review | `templates/review.md` | 검토/분석형 (판정 구조) |
+| analyze | `templates/review.md` | 검토/분석형 (분석 결과 구조) |
+| research | `templates/research.md` | 조사형 (조사-결론 구조) |
+| architect | `templates/architect.md` | 설계형 (아키텍처 구조) |
+| asset-manager | `templates/asset-manager.md` | 에셋형 (에셋 변경 내역) |
 
-## 작업 상세
-
-### [작업 ID]: [작업명]
-
-**상태**: 완료 | 실패
-**수행 내용**:
-- 내용 1
-- 내용 2
-
-**결과물**:
-- `path/to/file1.ts`
-- `path/to/file2.ts`
-
-**비고**: [특이사항]
-
----
-
-### [다음 작업...]
-
-## 생성/수정된 파일 목록
-
-| 파일 경로 | 작업 유형 | 관련 작업 |
-|----------|----------|----------|
-| path/to/file.ts | 생성 | T1 |
-| path/to/another.ts | 수정 | T2 |
-
-## 이슈 및 해결
-
-| 이슈 | 해결 방법 | 상태 |
-|------|----------|------|
-| [문제 설명] | [해결 방법] | 해결됨 |
-
-## 후속 작업 (해당 시)
-
-- [ ] 추가 작업 1
-- [ ] 추가 작업 2
-```
+> **참고**: 템플릿 선택 가이드 및 placeholder 목록은 `templates/_guide.md`를 참조하세요.
+> 템플릿은 권장 구조이며, 내용에 따라 reporter가 유연하게 조정할 수 있습니다.
 
 ### CSV 보고서 템플릿
 

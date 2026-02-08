@@ -2,7 +2,7 @@
 name: planner
 description: 작업 계획 수립 에이전트. 복잡한 작업을 분석하여 단계별 계획을 수립합니다. 작업 분해, 종속성 분석, 병렬 실행 가능 여부 판단을 수행합니다.
 model: inherit
-tools: Read, Write, Grep, Glob, Bash, WebSearch, WebFetch
+tools: Read, Write, Grep, Glob, Bash
 skills:
   - workflow-plan
 maxTurns: 30
