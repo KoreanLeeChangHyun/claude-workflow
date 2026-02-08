@@ -143,6 +143,26 @@ else
     DOC_PATH="$5"
     WORK_DIR="$6"
 
+    # 레거시 방식에서 WORK_DIR이 비어있을 때: registry.json에서 workId로 역해석
+    if [ -z "$WORK_DIR" ] && [ -n "$WORK_ID" ] && [[ "$WORK_ID" =~ ^[0-9]{6}$ ]]; then
+        _REG_FILE="${PROJECT_ROOT}/.workflow/registry.json"
+        if [ -f "$_REG_FILE" ] && command -v python3 &>/dev/null; then
+            WORK_DIR=$(WF_REG="$_REG_FILE" WF_WID="$WORK_ID" python3 -c "
+import json, os
+try:
+    with open(os.environ['WF_REG'], 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    wid = os.environ['WF_WID']
+    for key, val in data.items():
+        if key.endswith('-' + wid) and 'workDir' in val:
+            print(val['workDir'])
+            break
+except Exception:
+    pass
+" 2>/dev/null || true)
+        fi
+    fi
+
     # 레거시 방식에서도 workDir 절대 경로 계산 (DONE 배너 Slack 호출에 사용)
     if [ -n "$WORK_DIR" ]; then
         if [[ "$WORK_DIR" == /* ]]; then

@@ -32,11 +32,23 @@ reporter 에이전트가 보고서 작성 시 참조하는 템플릿 선택 가�
 
 ## Placeholder 목록
 
-| Placeholder | 설명 | 예시 |
-|-------------|------|------|
-| `{{workId}}` | 작업 ID | `143000` |
-| `{{command}}` | 실행 명령어 | `implement` |
-| `{{workName}}` | 작업명 | `로그인기능추가` |
-| `{{date}}` | 작성일 | `2026-02-09 14:30:00` |
-| `{{planPath}}` | 계획서 경로 | `plan.md` |
-| `{{workflowId}}` | 워크플로우 ID | `20260209-143000` |
+reporter 에이전트는 `command`, `workId`, `workDir`, `workPath` 4개의 입력 파라미터를 받습니다.
+아래 placeholder는 이 입력 파라미터로부터 도출합니다.
+
+| Placeholder | 설명 | 도출 방법 | 예시 |
+|-------------|------|----------|------|
+| `{{workId}}` | 작업 ID (HHMMSS 6자리) | 입력 파라미터 `workId` 직접 사용 | `143000` |
+| `{{command}}` | 실행 명령어 | 입력 파라미터 `command` 직접 사용 | `implement` |
+| `{{workName}}` | 작업명 (한글/영문) | `workDir`에서 3번째 경로 세그먼트 추출 (`workDir` 형식: `.workflow/YYYYMMDD-HHMMSS/<workName>/<command>`) | `로그인기능추가` |
+| `{{date}}` | 작성일 (KST) | `workDir`에서 2번째 경로 세그먼트의 YYYYMMDD-HHMMSS를 파싱하여 `YYYY-MM-DD HH:MM:SS` 형식으로 변환 | `2026-02-09 14:30:00` |
+| `{{planPath}}` | 계획서 경로 | `{workDir}/plan.md`로 구성 | `.workflow/20260209-143000/로그인기능추가/implement/plan.md` |
+| `{{workflowId}}` | 워크플로우 ID (YYYYMMDD-HHMMSS) | `workDir`에서 2번째 경로 세그먼트 추출 | `20260209-143000` |
+
+### workDir 경로 파싱 예시
+
+```
+workDir: .workflow/20260209-143000/로그인기능추가/implement
+                   ───────────────  ──────────────  ─────────
+                   {{workflowId}}   {{workName}}    {{command}}
+                   → {{date}} 도출
+```

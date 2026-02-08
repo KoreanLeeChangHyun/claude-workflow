@@ -70,9 +70,14 @@ workPath: <workDir>/work/
 ### reporter 수행 내용
 
 1. **보고서 작성**
-   - 작업 내역(`work/` 디렉터리) 취합 및 분석
-   - 보고서 경로를 `{workDir}/report.md`로 확정적 구성 (LLM 추론에 의존하지 않음)
-   - 보고서 저장: `{workDir}/report.md`
+   1. command에 해당하는 템플릿 파일을 Read 도구로 로드
+      - 매핑: implement/refactor/build/framework → `templates/implement.md`, review/analyze → `templates/review.md`, research → `templates/research.md`, architect → `templates/architect.md`, asset-manager → `templates/asset-manager.md`
+      - 템플릿 경로: `.claude/skills/workflow-report/templates/<템플릿파일>`
+      - placeholder 치환 가이드: `templates/_guide.md` 참조
+   2. 작업 내역(`work/` 디렉터리) 취합 및 분석
+   3. 템플릿의 `{{placeholder}}`를 실제 값으로 치환하고, 작업 내역을 기반으로 각 섹션 작성
+   4. 보고서 경로를 `{workDir}/report.md`로 확정적 구성 (LLM 추론에 의존하지 않음)
+   5. 보고서 저장: `{workDir}/report.md`
 
 2. **history.md 갱신**
    - `.workflow/history.md`에 작업 이력 행 추가 (상세 절차는 아래 참조)

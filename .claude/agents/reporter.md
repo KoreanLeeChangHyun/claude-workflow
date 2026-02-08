@@ -91,12 +91,51 @@ CLAUDE.md: 갱신완료
 
 **금지 항목:** 요약, 태스크 수, 변경 파일 수, 다음 단계 등 추가 정보 일체 금지
 
+## 템플릿 활용 지침
+
+보고서 작성 시 반드시 command에 맞는 템플릿을 로드하여 구조를 따릅니다.
+
+### 템플릿 경로
+
+`.claude/skills/workflow-report/templates/` 디렉토리에 command별 템플릿이 존재합니다.
+
+### command별 템플릿 매핑
+
+| command | 템플릿 파일 |
+|---------|------------|
+| implement | `templates/implement.md` |
+| refactor | `templates/implement.md` |
+| build | `templates/implement.md` |
+| framework | `templates/implement.md` |
+| review | `templates/review.md` |
+| analyze | `templates/review.md` |
+| research | `templates/research.md` |
+| architect | `templates/architect.md` |
+| asset-manager | `templates/asset-manager.md` |
+
+### 보고서 작성 절차
+
+1. **템플릿 로드**: command에 해당하는 템플릿 파일을 Read 도구로 로드
+   - 경로: `.claude/skills/workflow-report/templates/<템플릿파일>`
+   - 선택 가이드가 필요하면 `templates/_guide.md`도 참조
+2. **placeholder 치환**: 템플릿의 `{{placeholder}}`를 실제 값으로 치환
+   - `{{workId}}` -> workId 파라미터 값
+   - `{{command}}` -> command 파라미터 값
+   - `{{workName}}` -> workDir에서 파싱 (workDir의 세 번째 경로 요소)
+   - `{{date}}` -> workDir에서 파싱 (YYYYMMDD-HHMMSS의 앞 8자리를 YYYY-MM-DD로 변환)
+   - `{{workflowId}}` -> workDir에서 파싱 (YYYYMMDD-HHMMSS 부분)
+   - `{{planPath}}` -> `plan.md` (workDir 기준 상대 경로)
+3. **섹션 작성**: 작업 내역(`work/` 디렉터리)을 분석하여 각 섹션 내용 작성
+4. **선택 섹션 처리**: `(선택)` 표기된 섹션은 해당 없으면 생략
+5. **보고서 저장**: `{workDir}/report.md`에 저장
+
 ## 주의사항
 
 1. **작업 내역 로드 필수**: 보고서 작성 전 반드시 작업 내역 확인
-2. **적절한 형식 선택**: 작업에 맞는 템플릿 사용
-3. **REPORT + history.md 갱신 + CLAUDE.md 필요시 갱신 담당**: 모든 역할을 수행
-4. **간결하고 명확하게**: 핵심 정보 우선 배치
+2. **템플릿 로드 필수**: 보고서 작성 전 반드시 command에 맞는 템플릿을 Read로 로드
+3. **적절한 형식 선택**: 작업에 맞는 템플릿 사용
+4. **REPORT + history.md 갱신 + CLAUDE.md 필요시 갱신 담당**: 모든 역할을 수행
+5. **간결하고 명확하게**: 핵심 정보 우선 배치
 
 ## 에러 처리
 
