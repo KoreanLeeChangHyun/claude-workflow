@@ -127,6 +127,19 @@ wf-claude verify
 2. 터미널에서 cc 명령어로 Claude Code 시작
 ```
 
+**verify가 확인하는 키 목록:**
+
+| 키 | 소스 | 필수 |
+|----|------|------|
+| `alias cc`, `alias ccc` | `~/.zshrc` | 필수 |
+| `statusLine` (settings.json) | `~/.claude/settings.json` | 필수 |
+| `statusline.sh` (실행 권한) | `~/.claude/statusline.sh` | 필수 |
+| `CLAUDE_CODE_SLACK_WEBHOOK_URL` | `.claude.env` 또는 `~/.zshrc` | 선택 |
+| `CLAUDE_CODE_SLACK_BOT_TOKEN` | `.claude.env` (수동 설정) | 선택 |
+| `user.name`, `user.email` | `git config --global` | 필수 |
+
+> **참고**: `CLAUDE_CODE_SLACK_BOT_TOKEN`은 `/init:claude` 오케스트레이션 흐름에서 자동 설정되지 않습니다. `.claude.env` 파일에 `CLAUDE_CODE_SLACK_BOT_TOKEN=xoxb-...` 형식으로 수동 설정할 수 있으며, verify 단계에서 Webhook URL과 함께 검증됩니다.
+
 ---
 
 ## 관련 명령어
@@ -152,6 +165,14 @@ wf-claude verify
 
 ---
 
+## 사전 조건
+
+| 항목 | 설명 | 필수 |
+|------|------|------|
+| `wf-claude` 커맨드 | `~/.local/bin/wf-claude` wrapper 스크립트 (init-claude.sh 호출용) | 필수 |
+| `python3` | settings.json JSON 병합에 사용 (setup-statusline) | 필수 |
+| `~/.zshrc` | Shell alias, Slack export 등록 대상 (없으면 자동 생성) | 자동 |
+
 ## 오류 처리
 
 | 오류 상황 | 대응 |
@@ -160,3 +181,5 @@ wf-claude verify
 | `~/.claude` 디렉토리 없음 | 스크립트가 자동 생성 |
 | `.claude.env` 필수 필드 누락 | 해당 섹션 스킵, 편집 후 재실행 안내 |
 | Slack URL 형식 오류 | AskUserQuestion으로 재입력 요청 |
+| `python3` 미설치 | 에러 JSON 반환 (`error_detail: "python3 not found"`), python3 설치 안내 |
+| `python3` JSON 병합 실패 | 에러 JSON 반환 (`error_detail`에 stderr 포함), settings.json 수동 편집 안내 |

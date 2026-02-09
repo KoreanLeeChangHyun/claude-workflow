@@ -51,7 +51,7 @@ read_env() {
 
 # .claude.env에 KEY=value 추가/갱신
 # - 파일이 없으면 헤더와 함께 생성
-# - 기존 키가 있으면 업데이트 (macOS/Linux sed -i 호환)
+# - 기존 키가 있으면 업데이트 (임시 파일 + mv 방식, sed 인젝션 방어)
 # - 새 키이면 파일 끝에 추가
 set_env() {
     local key="$1"
@@ -72,12 +72,17 @@ ENVHEADER
     fi
 
     if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
-        # 기존 키 업데이트 (sed -i 의 macOS/Linux 호환)
-        if [[ "$OSTYPE" == "darwin"* ]]; then
-            sed -i '' "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
-        else
-            sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
-        fi
+        # 기존 키 업데이트 (임시 파일 + mv 방식으로 sed 인젝션 방어)
+        local tmpfile
+        tmpfile=$(mktemp "${ENV_FILE}.tmp.XXXXXX")
+        while IFS= read -r line || [ -n "$line" ]; do
+            if [[ "$line" == "${key}="* ]]; then
+                printf '%s\n' "${key}=${value}"
+            else
+                printf '%s\n' "$line"
+            fi
+        done < "$ENV_FILE" > "$tmpfile"
+        mv "$tmpfile" "$ENV_FILE"
     else
         # 새 키 추가
         echo "${key}=${value}" >> "$ENV_FILE"

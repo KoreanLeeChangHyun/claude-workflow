@@ -17,7 +17,7 @@
 # 설계 원칙:
 #   - stdout에 결과 출력 (JSON 형식)
 #   - 독립 실행 가능 (Claude 없이도 터미널에서 직접 실행)
-#   - ~/.zshrc 조작은 안전한 append-only 방식, 중복 체크 철저
+#   - ~/.zshrc 조작은 delete+append 방식 (중복 방지), 블록 마커로 관리
 #   - .claude.env는 KEY=value 형식 (표준 .env)
 # =============================================================================
 
@@ -105,6 +105,11 @@ cmd_check_alias() {
 # -----------------------------------------------------------------------------
 # setup-alias: alias 추가 (~/.zshrc에)
 # -----------------------------------------------------------------------------
+
+# 블록 마커 상수
+ALIAS_BLOCK_BEGIN="# >>> Claude Code aliases"
+ALIAS_BLOCK_END="# <<< Claude Code aliases"
+
 cmd_setup_alias() {
     # ~/.zshrc 없으면 생성
     if [ ! -f "$ZSHRC" ]; then
@@ -113,7 +118,17 @@ cmd_setup_alias() {
 
     local changed=0
 
-    # 기존 cc alias 제거 (중복 방지)
+    # --- 1. 블록 마커 방식으로 기존 블록 제거 ---
+    if grep -qF "$ALIAS_BLOCK_BEGIN" "$ZSHRC" 2>/dev/null; then
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            sed -i '' "/$ALIAS_BLOCK_BEGIN/,/$ALIAS_BLOCK_END/d" "$ZSHRC"
+        else
+            sed -i "/$ALIAS_BLOCK_BEGIN/,/$ALIAS_BLOCK_END/d" "$ZSHRC"
+        fi
+        changed=1
+    fi
+
+    # --- 2. 레거시 패턴 호환 삭제 (블록 마커 없는 이전 형식) ---
     if grep -q "^alias cc=" "$ZSHRC" 2>/dev/null; then
         if [[ "$OSTYPE" == "darwin"* ]]; then
             sed -i '' '/^alias cc=/d' "$ZSHRC"
@@ -123,7 +138,6 @@ cmd_setup_alias() {
         changed=1
     fi
 
-    # 기존 ccc alias 제거 (중복 방지)
     if grep -q "^alias ccc=" "$ZSHRC" 2>/dev/null; then
         if [[ "$OSTYPE" == "darwin"* ]]; then
             sed -i '' '/^alias ccc=/d' "$ZSHRC"
@@ -133,7 +147,6 @@ cmd_setup_alias() {
         changed=1
     fi
 
-    # 기존 Claude Code aliases 주석 제거 (중복 방지)
     if grep -q "^# Claude Code aliases$" "$ZSHRC" 2>/dev/null; then
         if [[ "$OSTYPE" == "darwin"* ]]; then
             sed -i '' '/^# Claude Code aliases$/d' "$ZSHRC"
@@ -142,12 +155,18 @@ cmd_setup_alias() {
         fi
     fi
 
-    # 새 alias 추가 (append-only)
+    # --- 3. 연속 빈 줄 정리 (2줄 이상 -> 1줄) ---
+    local tmpfile
+    tmpfile=$(mktemp)
+    awk 'NF{blank=0} !NF{blank++} blank<=1' "$ZSHRC" > "$tmpfile" && mv "$tmpfile" "$ZSHRC"
+
+    # --- 4. 새 alias 블록 추가 (블록 마커 포함) ---
     {
         echo ""
-        echo "# Claude Code aliases"
+        echo "$ALIAS_BLOCK_BEGIN"
         echo "alias cc='claude --dangerously-skip-permissions \"/init:workflow\"'"
         echo "alias ccc='claude --dangerously-skip-permissions --continue'"
+        echo "$ALIAS_BLOCK_END"
     } >> "$ZSHRC"
 
     if [ "$changed" -eq 1 ]; then
@@ -182,8 +201,16 @@ SETTINGS_EOF
     else
         # 파일이 있으면 statusLine 항목 존재 여부 체크
         if ! grep -q '"statusLine"' "$CLAUDE_SETTINGS" 2>/dev/null; then
+            # python3 사전 체크
+            if ! command -v python3 >/dev/null 2>&1; then
+                json_result "error" "python3이 설치되지 않았습니다. settings.json에 statusLine을 수동으로 추가하거나 python3을 설치하세요." \
+                    "settings_updated" "false" "script_created" "false" "error_detail" "python3 not found"
+                return 1
+            fi
+
             # statusLine 항목이 없으면 추가 (python3으로 JSON 안전 병합)
-            python3 -c "
+            local py_error
+            py_error=$(python3 -c "
 import json, sys
 
 with open('$CLAUDE_SETTINGS', 'r') as f:
@@ -198,7 +225,12 @@ data['statusLine'] = {
 with open('$CLAUDE_SETTINGS', 'w') as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
     f.write('\n')
-" 2>/dev/null
+" 2>&1)
+            if [ $? -ne 0 ]; then
+                json_result "error" "settings.json 병합 중 python3 오류가 발생했습니다." \
+                    "settings_updated" "false" "script_created" "false" "error_detail" "$py_error"
+                return 1
+            fi
             settings_updated="true"
         fi
     fi
@@ -272,18 +304,25 @@ cmd_setup_slack() {
     # ~/.zshrc에 export 추가 (중복 체크)
     if [ -f "$ZSHRC" ]; then
         if grep -q "^export CLAUDE_CODE_SLACK_WEBHOOK_URL=" "$ZSHRC" 2>/dev/null; then
-            # 기존 값 업데이트
-            if [[ "$OSTYPE" == "darwin"* ]]; then
-                sed -i '' "s|^export CLAUDE_CODE_SLACK_WEBHOOK_URL=.*|export CLAUDE_CODE_SLACK_WEBHOOK_URL=\"${url}\"|" "$ZSHRC"
-            else
-                sed -i "s|^export CLAUDE_CODE_SLACK_WEBHOOK_URL=.*|export CLAUDE_CODE_SLACK_WEBHOOK_URL=\"${url}\"|" "$ZSHRC"
-            fi
+            # 기존 값 업데이트 (임시 파일 + mv 방식으로 sed 인젝션 방어)
+            local tmpfile
+            tmpfile=$(mktemp "${ZSHRC}.tmp.XXXXXX")
+            while IFS= read -r line || [ -n "$line" ]; do
+                if [[ "$line" == export\ CLAUDE_CODE_SLACK_WEBHOOK_URL=* ]]; then
+                    printf '%s\n' "export CLAUDE_CODE_SLACK_WEBHOOK_URL=\"${url}\""
+                else
+                    printf '%s\n' "$line"
+                fi
+            done < "$ZSHRC" > "$tmpfile"
+            mv "$tmpfile" "$ZSHRC"
             json_result "ok" "CLAUDE_CODE_SLACK_WEBHOOK_URL이 업데이트되었습니다." "action" "updated"
         else
-            # 새로 추가
+            # 새로 추가 (주석 중복 방지: 기존 주석이 없을 때만 추가)
             {
-                echo ""
-                echo "# Slack Webhook for Claude Code"
+                if ! grep -q "^# Slack Webhook for Claude Code$" "$ZSHRC" 2>/dev/null; then
+                    echo ""
+                    echo "# Slack Webhook for Claude Code"
+                fi
                 echo "export CLAUDE_CODE_SLACK_WEBHOOK_URL=\"${url}\""
             } >> "$ZSHRC"
             json_result "ok" "CLAUDE_CODE_SLACK_WEBHOOK_URL이 추가되었습니다." "action" "created"
@@ -362,9 +401,14 @@ ENV_TEMPLATE
 
     # SSH 키 설정 (파일 존재 시)
     local ssh_configured="false"
-    if [ -n "$ssh_key_github" ] && [ -f "$ssh_key_github" ]; then
-        git config --global core.sshCommand "ssh -i \"$ssh_key_github\" -o IdentitiesOnly=yes"
-        ssh_configured="true"
+    local ssh_key_warning=""
+    if [ -n "$ssh_key_github" ]; then
+        if [ -f "$ssh_key_github" ]; then
+            git config --global core.sshCommand "ssh -i \"$ssh_key_github\" -o IdentitiesOnly=yes"
+            ssh_configured="true"
+        else
+            ssh_key_warning="파일 미존재: $ssh_key_github"
+        fi
     fi
 
     # After 상태 수집
@@ -379,14 +423,17 @@ ENV_TEMPLATE
         "$(json_escape "$before_name")" "$(json_escape "$before_email")" "$(json_escape "$before_ssh")"
     printf '"after":{"user_name":"%s","user_email":"%s","ssh_command":"%s"},' \
         "$(json_escape "$after_name")" "$(json_escape "$after_email")" "$(json_escape "$after_ssh")"
-    printf '"ssh_configured":%s}\n' "$ssh_configured"
+    printf '"ssh_configured":%s' "$ssh_configured"
+    if [ -n "$ssh_key_warning" ]; then
+        printf ',"ssh_key_warning":"%s"' "$(json_escape "$ssh_key_warning")"
+    fi
+    printf '}\n'
 }
 
 # -----------------------------------------------------------------------------
 # verify: 전체 설정 검증
 # -----------------------------------------------------------------------------
 cmd_verify() {
-    local results=()
     local all_ok=true
 
     # 1. Shell alias 검증
@@ -419,15 +466,16 @@ cmd_verify() {
     fi
 
     # 4. Slack 환경변수 검증 (선택사항이므로 all_ok에 영향 없음)
+    #    빈값(KEY= 또는 KEY="") 제외: ^KEY=.\+ 패턴으로 값이 있는 경우만 매칭
     local slack_env="false"
     local slack_source=""
-    if [ -f "$ENV_FILE" ] && grep -q "^CLAUDE_CODE_SLACK_BOT_TOKEN=" "$ENV_FILE" 2>/dev/null; then
+    if [ -f "$ENV_FILE" ] && grep -q "^CLAUDE_CODE_SLACK_BOT_TOKEN=.\+" "$ENV_FILE" 2>/dev/null; then
         slack_env="true"
         slack_source="claude_env"
-    elif [ -f "$ENV_FILE" ] && grep -q "^CLAUDE_CODE_SLACK_WEBHOOK_URL=" "$ENV_FILE" 2>/dev/null; then
+    elif [ -f "$ENV_FILE" ] && grep -q "^CLAUDE_CODE_SLACK_WEBHOOK_URL=.\+" "$ENV_FILE" 2>/dev/null; then
         slack_env="true"
         slack_source="claude_env"
-    elif [ -f "$ZSHRC" ] && grep -q "^export CLAUDE_CODE_SLACK_WEBHOOK_URL=" "$ZSHRC" 2>/dev/null; then
+    elif [ -f "$ZSHRC" ] && grep -q "^export CLAUDE_CODE_SLACK_WEBHOOK_URL=.\+" "$ZSHRC" 2>/dev/null; then
         slack_env="true"
         slack_source="zshrc"
     fi
