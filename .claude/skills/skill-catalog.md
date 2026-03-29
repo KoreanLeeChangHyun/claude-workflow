@@ -1,7 +1,7 @@
 # Skill Catalog
 
 > 이 파일은 `catalog_sync.py`에 의해 자동 생성됩니다. 직접 편집하지 마세요.
-> 활성 스킬: 58개 (전문화: 58, 프로젝트: 0)
+> 활성 스킬: 59개 (전문화: 59, 프로젝트: 0)
 
 ## Command Default Mapping
 
@@ -34,7 +34,7 @@
 | design-web-guidelines | Provides web accessibility and standards compliance checklists for implementation tasks. Use when building or reviewing web interfaces that must meet WCAG 2.1 Level AA, ARIA requirements, keyboard navigation, form accessibility, color contrast, screen reader compatibility, semantic HTML structure, dark mode support, or internationalization readiness. |
 | devops-ci-pipeline | Designs and configures CI/CD pipelines covering build/test/deploy stage composition, caching strategies, secret management, and monorepo pipeline patterns. Use when setting up or optimizing a CI/CD pipeline, designing build and deploy stages, configuring pipeline caching, managing secrets and environment variables in continuous integration, or automating deployment for monorepo projects. |
 | devops-docker-compose | Configures Docker Compose-based local development environments and multi-container orchestration. Covers service networking, volume and environment variable management, and docker-compose.yml best practices. Use when setting up a local dev environment with Docker or docker-compose, orchestrating multi-container services, configuring inter-service networking, managing volumes and env vars, or defining container health checks and dependency ordering. |
-| devops-git-config | Auto-configures git config by reading Git username, email, and SSH key settings from the .claude.env file. Use when initializing a Git environment, configuring git user identity, setting SSH key paths, or batch-applying local Git settings from environment variables. |
+| devops-git-config | Auto-configures git config by reading Git username, email, and SSH key settings from the .claude.workflow/.env file. Use when initializing a Git environment, configuring git user identity, setting SSH key paths, or batch-applying local Git settings from environment variables. |
 | devops-github | Handles GitHub integration using the gh CLI. Use when committing and pushing work results to GitHub, creating or managing pull requests, viewing or creating issues, or managing branches in a GitHub repository. |
 | devops-runtime-contract | Generates runtime schema validation code by analyzing existing types and interfaces to auto-derive Zod (TypeScript), beartype (Python), or io-ts schemas and insert checks at trust boundaries. Use when adding runtime validation at API boundaries, parsing config files or environment variables, ingesting external data, or verifying contract compliance at system entry points. |
 | devops-terminal-hyperlink | OSC 8 터미널 하이퍼링크(terminal hyperlink) 가이드. Bash/Python 스크립트에서 클릭 가능한 경로와 URL 링크를 터미널 출력에 삽입하는 방법을 제공한다. Use when adding clickable file paths or hyperlinks to terminal output, embedding OSC 8 links in banners or status lines, or displaying labeled paths with clickable terminal links in scripts. |
@@ -73,6 +73,7 @@
 | testing-design | ISTQB v4.0 test design skill that auto-generates test cases by analyzing function signatures and type information using equivalence partitioning (EP), boundary value analysis (BVA), decision table (DT), and state transition (ST) techniques. Use when generating structured test cases from code, improving input domain coverage, or systematically identifying edge cases and boundary conditions from type signatures. |
 | testing-mutation | Mutation testing skill that runs incremental mutation testing on changed files using Stryker, mutmut, or cargo-mutants, calculates mutation scores, detects survived mutants, and enforces quality gates for PR integration. Use when verifying test suite effectiveness, measuring mutation score on changed code, or validating that tests can detect real defects rather than just achieving line coverage. |
 | testing-property-based | Property-based testing skill that infers properties from function signatures, selects type-based generators, and generates PBT code using Hypothesis (Python), fast-check (JS/TS), or QuickCheck (Haskell). Use when adding property-based tests to an existing test suite, discovering edge cases that example-based tests miss, performing stateful testing, or automatically shrinking minimal failure inputs. |
+| workflow-system | Claude Code workflow system infrastructure skills: hooks system management, report output generation, script naming conventions, CLI status line configuration, and verification before completion. Triggers: 'hook', '훅', 'PreToolUse', 'PostToolUse', 'Hook 설정', 'rm -rf', 'git reset --hard', 'git push --force', '위험 명령어', 'dangerous command', 'changelog', 'release notes', '변경 이력', '릴리스 노트', 'PR', 'pull request', 'PR 요약', 'scripts', '스크립트', 'alias', 'flow-', 'statusline 설정', '상태줄 설정', 'Done', 'Complete', '완료', '끝', 'PASS', '통과'. |
 
 ## Project Skills
 

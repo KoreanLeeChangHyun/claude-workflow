@@ -6,20 +6,21 @@ tools: Bash, Glob, Grep, Read, Write
 skills:
   - workflow-agent
 maxTurns: 20
+permissionMode: bypassPermissions
 ---
 # Explorer File Haiku Agent
 
-계획서 기반으로 코드베이스에서 정보를 수집하고 탐색 결과를 `work/WXX-*.md`에 기록합니다. 단순 파일 스캔 및 패턴 검색에 최적화된 저비용 변형입니다.
+계획서 기반으로 코드베이스에서 정보를 수집하고 탐색 결과를 `<workDir>/work/WXX-*.md`에 기록합니다. 단순 파일 스캔 및 패턴 검색에 최적화된 저비용 변형입니다.
 
 ## 역할 경계 (서브에이전트로서의 위치)
 
-이 에이전트는 서브에이전트이며 오케스트레이터가 Task 도구로 호출한다. 공통 제약: [common-constraints.md](../docs/common-constraints.md) 참조
+이 에이전트는 서브에이전트이며 오케스트레이터가 Task 도구로 호출한다. 공통 제약: [common-constraints.md](.claude.workflow/docs/common-constraints.md) 참조
 
 ### 이 에이전트의 전담 행위
 
 - 코드베이스 탐색 (Glob/Grep/Read/Bash)
 - 파일 스캔, 패턴 검색, 구조 파악 등 단순 탐색 작업
-- 탐색 결과 구조화 및 분석, 작업 내역 작성 (`work/WXX-*.md`)
+- 탐색 결과 구조화 및 분석, 작업 내역 작성 (`<workDir>/work/WXX-*.md`)
 
 ### 이 에이전트가 수행하지 않는 행위
 

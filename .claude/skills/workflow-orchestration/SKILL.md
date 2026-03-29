@@ -52,17 +52,17 @@ stateDiagram-v2
 
 ## Supported Commands
 
-| Command | Description |
-|---------|------------|
-| implement | Feature implementation, refactoring, architecture diagrams |
-| review | Code review |
-| research | Research/investigation and internal asset analysis |
+| Command | Description | Worktree |
+|---------|------------|----------|
+| implement | Feature implementation, refactoring, architecture diagrams | O |
+| review | Code review | X |
+| research | Research/investigation and internal asset analysis | X |
 
 ## Input Parameters
 
 - `command`: execution command (implement, review, research)
 
-> `/wf` commands use `$ARGUMENTS` for command detection. User requests are handled via `.kanban/T-NNN.xml` ticket files.
+> `/wf` commands use `$ARGUMENTS` for command detection. User requests are handled via `.kanban/open/T-NNN.xml` ticket files (상태별 디렉터리: `open/`, `progress/`, `review/`, `done/`).
 >
 > **SSoT XML structure reference:** See [`references/T-NNN.xml`](references/T-NNN.xml) for the canonical ticket file template.
 
@@ -145,7 +145,7 @@ flow-claude end <registryKey>             # 워크플로우 종료
 | WORK done | `flow-step start`, reporter call | Work summary, 내부 추론 텍스트 |
 | REPORT done | `flow-update status DONE`, `flow-finish`, `flow-claude end` -> **turn 즉시 종료** | Report summary, post-DONE text, 추가 도구 호출 |
 
-[^1]: autoApprove=false(`-n` 플래그 지정) 시에는 AskUserQuestion 허용
+[^1]: autoApprove=false(`-n` 플래그 지정) 시에만 AskUserQuestion 허용. `-n` 미지정(기본) 시 PLAN~DONE 전 구간 AskUserQuestion 0회
 
 ---
 
@@ -157,9 +157,10 @@ flow-claude end <registryKey>             # 워크플로우 종료
 
 1. **Command/플래그 파싱** -- `/wf -s implement` -> command=implement, autoApprove=true. `-n` 지정 시 autoApprove=false. 체인 command(예: `research>implement`)는 전체 문자열 그대로 보관
 2. **시작 배너** -- `flow-claude start <command>`
-3. **제목 생성** -- 티켓 파일(`.kanban/T-NNN.xml`) 읽어 20자 이내 한글 제목 생성 (오케스트레이터 직접)
-4. **initialization.py 실행** -- `flow-init <command> "<title>" #N`. 실패 시 `FAIL` + 비정상 종료 코드
+3. **제목 생성** -- 티켓 파일(`.kanban/open/T-NNN.xml` 또는 상태별 디렉터리에서 탐색) 읽어 20자 이내 한글 제목 생성 (오케스트레이터 직접)
+4. **initialization.py 실행** -- `flow-init <command> "<title>" [--ticket T-NNN]`. mode는 현재 full만 지원하므로 생략 권장. 기존 위치 인자 형식(`[mode] [#N]`)도 하위호환 지원. 실패 시 `FAIL` + 비정상 종료 코드
 5. **init-result.json 파싱** -- 종료 코드 0이면 최신 `.workflow/` 디렉터리의 init-result.json을 Read
+6. **워크트리 cwd 전환** -- init-result.json의 `worktreePath`가 존재하면 `cd <절대경로>` Bash 실행으로 cwd를 워크트리로 전환 (상태바에 피처 브랜치 표시). `worktreePath`가 없으면 생략
 
 **Return Value Retention (후속 단계에 전달):**
 
@@ -171,6 +172,7 @@ flow-claude end <registryKey>             # 워크플로우 종료
 | `command` | PLAN~DONE | 실행 명령어 |
 | `autoApprove` | PLAN | -n 플래그 여부 |
 | `title`, `ticketNumber` | DONE | flow-finish 인자 |
+| `worktreePath` | INIT | 워크트리 절대 경로 (cwd 전환용) |
 
 **종료 코드:** 0=성공, 1=티켓 비어있음, 2=인자 오류, 4=초기화 실패
 
@@ -193,7 +195,25 @@ Task(subagent_type="planner", prompt="command: <command>, workId: <workId>, requ
 | `quality_score` | 동작 |
 |-----------------|------|
 | 필드 없음 / `>= 0.6` | planner 호출로 진행 |
-| `< 0.6` | 피드백 표시 후 AskUserQuestion. `missing_tags`에 constraints/criteria 포함 시 "계속 진행" 선택지 제거 |
+| `< 0.6` | `[WARN]` workflow.log에 기록 + planner 프롬프트에 품질 경고 블록 추가 후 정상 진행. 보고서에 품질 경고 섹션 자동 포함 |
+
+**quality_score < 0.6 자동 fallback 절차:**
+
+1. `[WARN]` workflow.log에 기록: `quality_score` 값, `missing_tags` 목록, `feedback` 내용
+2. planner 호출 프롬프트 말미에 아래 품질 경고 블록을 추가 (누락 태그 명시 + 가정 사항 기술 지시)
+3. planner 정상 호출 (중단 없음). `missing_tags`에 `constraints`/`criteria` 포함 여부와 무관하게 동일 처리
+
+**planner 프롬프트에 추가되는 품질 경고 블록:**
+
+```
+[품질 경고] 사용자 프롬프트의 quality_score가 {score}입니다.
+누락 태그: {missing_tags}
+비어있는 태그: {empty_tags}
+피드백: {feedback_list}
+
+지침: 누락/부족한 정보에 대해 합리적인 가정(assumption)을 수립하고,
+계획서 "가정 사항" 섹션에 명시하세요. 가정에 기반한 작업임을 표시하세요.
+```
 
 ### 2a-Post: planner 반환 후 호출 순서
 
@@ -290,7 +310,7 @@ flow-update task-status <registryKey> <taskId> failed      # 실패
 |------|------|
 | 독립 태스크 실패 | 다른 독립 태스크 계속 진행 |
 | 종속 선행 실패 | 해당 종속 체인 중단, 다른 체인 계속 |
-| 실패율 >= 50% | 워크플로우 중단, AskUserQuestion |
+| 실패율 >= 50% | 실패 태스크 skip + 남은 태스크 계속 실행 + REPORT 정상 진행. `[WARN]` workflow.log에 실패율, 실패 태스크 ID, skip된 종속 태스크 ID 기록. 보고서에 실패 태스크 보고 섹션 자동 포함 |
 | Worker "실패" | 최대 3회 재호출. 3회 실패 시 해당 태스크 실패 기록 |
 
 ### Hooks 수정 태스크 패턴
@@ -370,7 +390,7 @@ flow-claude end <registryKey>                                                   
 | Action | Description |
 |--------|-------------|
 | Step banner Bash calls | `flow-step start/end` + `flow-phase` + `flow-finish`/`flow-claude end` |
-| AskUserQuestion calls | error escalation, user confirmation |
+| AskUserQuestion calls | `-n` 수동 확인 모드 전용. 기본 모드에서는 자동 fallback으로 대체 |
 | State transition | `flow-update both/status/context/task-status/usage-pending/env/link-session/usage/usage-finalize` |
 | Sub-agent return extraction | 상태만 확인 (1줄). 산출물 경로는 컨벤션으로 확정 |
 | Workflow finalization | `flow-finish` -> `flow-claude end` |

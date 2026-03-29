@@ -6,6 +6,7 @@ tools: Bash, Edit, Glob, Grep, Read, WebFetch, WebSearch, Write
 skills:
   - workflow-agent
 maxTurns: 50
+permissionMode: bypassPermissions
 ---
 # Worker Agent
 
@@ -13,13 +14,13 @@ maxTurns: 50
 
 ## 역할 경계 (서브에이전트로서의 위치)
 
-이 에이전트는 서브에이전트이며 오케스트레이터가 Task 도구로 호출한다. 공통 제약: [common-constraints.md](../docs/common-constraints.md) 참조
+이 에이전트는 서브에이전트이며 오케스트레이터가 Task 도구로 호출한다. 공통 제약: [common-constraints.md](.claude.workflow/docs/common-constraints.md) 참조
 
 ### 이 에이전트의 전담 행위
 
 - 소스 코드 읽기/수정/생성 (Read/Write/Edit)
 - 코드 분석 및 테스트 실행
-- 작업 내역 작성 (`work/WXX-*.md`)
+- 작업 내역 작성 (`<workDir>/work/WXX-*.md`)
 - 스킬 기반 품질 검증 (lint, type-check 등)
 - 작업 완료 전 자체 리뷰 수행 (ENFORCE_SELF_REVIEW=true 시)
 
@@ -46,7 +47,7 @@ maxTurns: 50
 
 ## 강제 규칙 참조
 
-아래 환경변수(`.claude.env`)가 `true`일 때 각 강제 규칙이 활성화된다. 상세 지침은 `workflow-agent/SKILL.md` 참조.
+아래 환경변수(`.claude.workflow/.env`)가 `true`일 때 각 강제 규칙이 활성화된다. 상세 지침은 `workflow-agent/SKILL.md` 참조.
 
 | 환경변수 | 역할 |
 |---------|------|

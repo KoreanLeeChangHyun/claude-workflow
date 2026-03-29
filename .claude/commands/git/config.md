@@ -1,11 +1,11 @@
 ---
-description: .claude.env에서 Git 설정을 읽어 git config를 자동 설정합니다.
+description: .claude.workflow/.settings에서 Git 설정을 읽어 git config를 자동 설정합니다.
 argument-hint: "[--global | --local]"
 ---
 
 # Git Config
 
-`.claude.env` 파일에서 Git 설정 정보를 읽어 `git config`를 자동으로 설정합니다.
+`.claude.workflow/.env` 파일에서 Git 설정 정보를 읽어 `git config`를 자동으로 설정합니다.
 
 ## 입력: $ARGUMENTS
 
@@ -16,7 +16,7 @@ argument-hint: "[--global | --local]"
 
 ## 스크립트
 
-`.claude/scripts/git/git_config.py` - 옵션: `[--global|--local]`
+`.claude.workflow/scripts/git/git_config.py` - 옵션: `[--global|--local]`
 
 ## 오케스트레이션 흐름
 
@@ -27,13 +27,13 @@ argument-hint: "[--global | --local]"
 $ARGUMENTS에 따라 Bash 도구로 실행:
 
 ```bash
-python3 .claude/scripts/git/git_config.py $ARGUMENTS
+flow-gitconfig $ARGUMENTS
 ```
 
 $ARGUMENTS가 없으면 기본값 `--global` 적용:
 
 ```bash
-python3 .claude/scripts/git/git_config.py --global
+flow-gitconfig --global
 ```
 
 ### Step 2. 결과 출력
@@ -41,7 +41,7 @@ python3 .claude/scripts/git/git_config.py --global
 스크립트의 stdout 출력을 그대로 사용자에게 표시합니다.
 
 스크립트가 다음 내용을 자동 처리합니다:
-- `.claude.env` 파일에서 환경변수 로드
+- `.claude.workflow/.env` 파일에서 환경변수 로드
 - 필수 환경변수 검증 (CLAUDE_CODE_GIT_USER_NAME, CLAUDE_CODE_GIT_USER_EMAIL)
 - Before 상태 수집
 - git config 설정 적용
@@ -67,7 +67,7 @@ git:config --local
 
 | 오류 상황 | 대응 |
 |----------|------|
-| `.claude.env` 파일 없음 | 에러 메시지 출력 후 중단 |
+| `.claude.workflow/.env` 파일 없음 | 에러 메시지 출력 후 중단 |
 | `CLAUDE_CODE_GIT_USER_NAME` 미설정 | 에러 메시지 출력 후 중단 |
 | `CLAUDE_CODE_GIT_USER_EMAIL` 미설정 | 에러 메시지 출력 후 중단 |
 | SSH 키 파일 없음 | WARNING 출력, SSH 설정 스킵 |

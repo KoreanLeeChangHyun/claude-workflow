@@ -91,10 +91,12 @@ REPORT 단계 완료 후 티켓 상태를 자동 전이한다.
 flow-kanban move T-NNN review
 ```
 
-티켓 번호는 `wf.md` Steps 3-1~3-4에서 파싱된 `#N` 인자를 사용한다. 티켓 파일 경로는 `.kanban/T-NNN.xml`이다.
+티켓 번호는 `wf.md` Steps 3-1~3-4에서 파싱된 `#N` 인자를 사용한다. 티켓 파일 경로는 `.kanban/open/T-NNN.xml`이다.
 
 - 구현이 완료된 티켓을 Review 상태로 전이한다
 - `wf -s implement #N` 실행 시 `wf.md`가 이미 티켓 XML 내용을 파싱하여 전달하므로 별도 파싱은 불필요하다
+
+> **Review 후속 흐름**: Review 전이 후 사용자가 `/wf -d N`으로 간단 검토 -> 완료/상세 review 분기를 진행한다. 워크플로우 완료 시점에서 자동 merge는 수행되지 않는다.
 
 ### cleanup 절차 (implement/research/review 공통)
 
@@ -110,14 +112,14 @@ flow-kanban move T-NNN review
 
 > **스킬 의존성**: `research-prompt-engineering` (frontmatter `skills:` 필드에 명시됨)
 
-`.kanban/T-NNN.xml` 티켓 파일을 사용자와의 자유 대화를 통해 점진적으로 작성하거나 개선하는 워크플로우 커맨드 스킬. 워크플로우(FSM/가드/서브에이전트)와 무관한 독립 명령어.
+`.kanban/open/T-NNN.xml` 티켓 파일을 사용자와의 자유 대화를 통해 점진적으로 작성하거나 개선하는 워크플로우 커맨드 스킬. 워크플로우(FSM/가드/서브에이전트)와 무관한 독립 명령어.
 
-티켓 파일은 XML 구조를 사용합니다:
+티켓 파일은 flat XML 구조를 사용합니다:
 - 루트 요소: `<ticket>`
-- `<metadata>` 래퍼: `<number>`, `<title>`, `<datetime>`, `<status>`, `<current>` (현재 활성 subnumber는 `<current>` 값으로 결정)
-- `<submit>` 래퍼: active subnumber 목록
-- `<history>` 래퍼: 비활성(이전 사이클) subnumber 목록
-- 작업 단위: `<subnumber id="N">` (직하에 `<command>` 태그, `<prompt>` 래퍼 내에 goal/target/constraints/criteria/context)
+- `<metadata>`: `<number>`, `<title>`, `<datetime>`, `<status>`, `<command>`
+- `<relations>`: 티켓 간 관계 링크 (`<relation type="derived-from" ticket="T-NNN" />`)
+- `<prompt>`: 작업 정의 필드 (`<goal>`, `<target>`, `<constraints>`, `<criteria>`, `<context>`)
+- `<result>`: 실행 결과 (`<registrykey>`, `<workdir>`, `<summary>`) 또는 미실행 시 self-closing `<result />`
 
 상세 실행 절차는 `.claude/commands/wf.md`를 참조한다.
 
@@ -137,9 +139,9 @@ flow-kanban move T-NNN review
 
 ### XML 티켓 처리 규칙
 
-- `<command>` 태그는 `<subnumber id="N">` 직하(자식)에 위치. `<prompt>` 래퍼 밖에 배치됨. 잠금 판정은 XML `<status>` 요소(`Open`/`In Progress`/`Review`)로 판별
-- `<goal>`, `<target>`, `<constraints>`, `<criteria>`, `<context>` 태그는 subnumber 내부의 `<prompt>` 래퍼 안에 위치
-- 사용자 입력 갱신은 현재 활성 subnumber(`<current>` 값) 내부의 `<prompt>` 래퍼 자식 요소를 대상으로 함
+- `<command>` 태그는 `<metadata>` 직하(자식)에 위치. 잠금 판정은 XML `<status>` 요소(`Open`/`In Progress`/`Review`)로 판별
+- `<goal>`, `<target>`, `<constraints>`, `<criteria>`, `<context>` 태그는 티켓 루트 직하의 `<prompt>` 래퍼 안에 위치
+- 사용자 입력 갱신은 `<prompt>` 래퍼 자식 요소를 대상으로 함
 - 기존 티켓 편집 시 원시 XML 대신 읽기 쉬운 구조화 형식으로 출력
 
 ### 웹검색/코드탐색 자율 수행
@@ -191,6 +193,17 @@ flow-kanban move T-NNN review
    - 리포트는 `.workflow/<YYYYMMDD-HHMMSS>/<작업명>/research/report.md`에 저장된다
 
 리포트 템플릿, 주의사항 등 상세 절차는 research-general 스킬(`.claude/skills/research-general/SKILL.md`)을 참조한다.
+
+### 코드 수정 금지 제약
+
+> **WARNING**: 리서치 워크플로우에서 Edit/Write 도구로 소스 코드를 수정하는 행위는 절대 금지된다. research는 보고서만 산출하므로 코드 수정이 불필요하다.
+
+| 구분 | 대상 | 허용 여부 |
+|------|------|----------|
+| 허용 | 보고서 파일(report.md, work/*.md) 읽기/쓰기 | O |
+| 금지 | 소스 코드 파일(.js, .ts, .py, .css, .html 등) 수정 (Edit/Write 도구) | X |
+
+이 제약은 `readonly_session_guard.py` PreToolUse 가드로 기술적으로 강제됨.
 
 ### 출처 검증 기준
 
@@ -253,10 +266,12 @@ REPORT 단계 완료 후 티켓 상태를 자동 전이한다.
 flow-kanban move T-NNN review
 ```
 
-티켓 번호는 `wf.md` Steps 3-1~3-4에서 파싱된 `#N` 인자를 사용한다. 티켓 파일 경로는 `.kanban/T-NNN.xml`이다.
+티켓 번호는 `wf.md` Steps 3-1~3-4에서 파싱된 `#N` 인자를 사용한다. 티켓 파일 경로는 `.kanban/open/T-NNN.xml`이다.
 
 - 연구/분석이 완료된 티켓을 Review 상태로 전이한다
 - `wf -s research #N` 실행 시 `wf.md`가 이미 티켓 XML 내용을 파싱하여 전달하므로 별도 파싱은 불필요하다
+
+> **Review 후속 흐름**: Review 전이 후 사용자가 `/wf -d N`으로 간단 검토 -> 완료/상세 review 분기를 진행한다. 워크플로우 완료 시점에서 자동 merge는 수행되지 않는다.
 
 ---
 
@@ -282,6 +297,8 @@ flow-kanban move T-NNN review
 | 금지 | 소스 코드 파일(.js, .ts, .py, .css, .html 등) 수정 (Edit/Write 도구) | X |
 
 코드 수정이 필요한 경우 보고서에 수정 방안을 기술하고 별도 implement 사이클에서 처리한다.
+
+이 제약은 `readonly_session_guard.py` PreToolUse 가드로 기술적으로 강제됨.
 
 ### 심각도 기준
 
@@ -349,13 +366,60 @@ REPORT 단계 완료 후 티켓 상태를 자동 전이한다.
 flow-kanban move T-NNN review
 ```
 
-티켓 파일은 `.kanban/T-NNN.xml`이다.
+티켓 파일은 `.kanban/open/T-NNN.xml`이다.
+
+---
+
+## Review Completion Flow
+
+워크플로우 완료 후 Review 상태가 된 티켓의 검토 및 완료 처리 절차.
+
+### 개요
+
+implement/research 워크플로우 완료 시 finalization.py가 티켓을 Review 상태로 전이한다. 이후 사용자가 `/wf -d N`을 실행하면 아래 3-way 분기가 동작한다.
+
+### 분기 흐름
+
+| 분기 | 트리거 | 결과 |
+|------|--------|------|
+| 간단 검토 통과 + 완료 선택 | 검토 항목 전체 OK + 사용자 "1" 선택 | flow-merge 파이프라인 실행 -> Done |
+| 간단 검토 경고 + 완료 선택 | 검토 항목 WARN + 사용자 "1" 선택 | flow-merge 파이프라인 실행 -> Done (경고 무시) |
+| 상세 review 선택 | 사용자 "2" 선택 | 새 review 티켓 생성 + `derived-from` link -> /wf -s N으로 review 워크플로우 실행 |
+| 취소 | 사용자 "0" 선택 | Review 상태 유지 |
+
+### 간단 검토 항목
+
+| 항목 | 검증 방법 | 판정 기준 |
+|------|----------|----------|
+| 보고서-변경 파일 일치 | report.md 파일 목록 vs git diff --name-only | 불일치 0건 = OK, 1건 이상 = WARN |
+| py_compile | python3 -m py_compile <변경된 .py 파일> | 실패 0건 = OK, 1건 이상 = WARN, .py 파일 없음 = N/A |
+| 보고서 존재 | report.md 파일 존재 확인 | 존재 = OK, 미존재 = WARN |
+
+### merge 실행 조건
+
+> **CRITICAL**: merge는 반드시 사용자의 명시적 "완료" 선택 후에만 실행된다. 워크플로우 완료(DONE 전이) 시점에서는 kanban Review 전이만 수행하고, 커밋/merge/worktree 정리는 수행하지 않는다.
+
+### 상세 review 연계
+
+상세 review 선택 시 새 review 티켓을 생성하여 기존 review command 워크플로우를 재활용한다:
+1. `flow-kanban create "T-NNN review" --command review`로 새 review 티켓 생성
+2. `flow-kanban link T-NEW --derived-from T-NNN`으로 원본 티켓과 관계 설정
+3. 사용자가 `/wf -s NEW`로 review 워크플로우 실행
+4. review 완료 후 원본 티켓은 Review 상태 유지
+5. 사용자가 `/wf -d N`으로 최종 완료 처리
+
+### 관련 스크립트
+
+| 스크립트 | 역할 |
+|---------|------|
+| flow-merge (merge_pipeline.py) | 커밋 -> merge -> worktree 정리 -> kanban done 파이프라인 |
+| finalization.py | 워크플로우 완료 시 Review 전이 (자동 merge 금지) |
 
 ---
 
 ## Submit Command (티켓 제출)
 
-`.kanban/T-NNN.xml` 티켓 파일의 `<command>` 태그를 읽어 해당 워크플로우를 자동 실행하는 커맨드 스킬.
+상태별 디렉터리(`.kanban/open/`, `.kanban/progress/`, `.kanban/review/`)의 `T-NNN.xml` 티켓 파일의 `<command>` 태그를 읽어 해당 워크플로우를 자동 실행하는 커맨드 스킬.
 
 상세 실행 절차는 `.claude/commands/wf.md`를 참조한다.
 
@@ -369,9 +433,9 @@ flow-kanban move T-NNN review
 
 ### 티켓 파일 처리 규칙
 
-- `#N` 지정 시: `.kanban/T-NNN.xml` 정확 매칭으로 티켓 파일 탐색
-- `#N` 미지정 시: `.kanban/` 디렉터리의 XML 파일을 스캔하여 Open 상태 티켓을 자동 선택
-- `<current>` 값이 `0` 또는 미존재 시: 에러 출력 후 종료
+- `#N` 지정 시: `.kanban/open/T-NNN.xml`, `.kanban/progress/T-NNN.xml`, `.kanban/review/T-NNN.xml` 순으로 탐색
+- `#N` 미지정 시: `.kanban/open/` 디렉터리의 XML 파일을 스캔하여 Open 상태 티켓을 자동 선택
+- `<command>` 미존재 또는 빈 값 시: 에러 출력 후 종료
 - `<command>` 유효 값: `implement`, `research`, `review`
 
 ### 비워크플로우 독립 명령어 (submit)
