@@ -36,6 +36,7 @@ from common import (
     resolve_project_root,
     scan_active_workflows,
 )
+from data.constants import HALLU_TARGET_AGENT_TYPES, HOOK_HALLUCINATION_LOGGER
 
 PROJECT_ROOT = resolve_project_root()
 
@@ -67,26 +68,38 @@ NON_WORKER_AGENT_TYPES: set[str] = {
 }
 
 
-def _normalize_agent_type(raw: str) -> str:
+def _normalize_agent_type(raw: str) -> tuple[str, str]:
     """agent_type 원시 문자열을 VALID_AGENT_TYPES 중 하나로 정규화한다.
 
     "worker-opus", "worker-sonnet" 등 모델 접미사가 붙은 타입을
-    정규 타입으로 변환한다. 예외를 발생시키지 않는 순수 문자열 비교 함수.
+    정규 타입과 모델 접미사 튜플로 변환한다.
+    예외를 발생시키지 않는 순수 문자열 비교 함수.
 
     Args:
         raw: 정규화 전 agent_type 문자열
 
     Returns:
-        VALID_AGENT_TYPES에 속하는 정규 타입. 매칭 없으면 원본 raw 반환.
+        (normalized_type, model_suffix) 튜플.
+        - normalized_type: VALID_AGENT_TYPES에 속하는 정규 타입. 매칭 없으면 원본 raw.
+        - model_suffix: 모델 접미사 문자열. 예: "sonnet", "opus". 없으면 빈 문자열.
+
+    Examples:
+        >>> _normalize_agent_type("worker-sonnet")
+        ("worker", "sonnet")
+        >>> _normalize_agent_type("worker")
+        ("worker", "")
+        >>> _normalize_agent_type("orchestrator")
+        ("orchestrator", "")
     """
     if not isinstance(raw, str):
-        return raw
+        return (raw, "")
     if raw in VALID_AGENT_TYPES:
-        return raw
+        return (raw, "")
     for t in VALID_AGENT_TYPES:
         if raw.startswith(t + "-"):
-            return t
-    return raw
+            suffix = raw[len(t) + 1:]
+            return (t, suffix)
+    return (raw, "")
 
 
 # =============================================================================
@@ -210,6 +223,48 @@ def parse_jsonl_usage(filepath: str) -> Optional[dict[str, int]]:
     return totals
 
 
+def count_tool_use_in_jsonl(filepath: str) -> int:
+    """JSONL 파일에서 assistant 레코드의 tool_use 항목 수를 카운트한다.
+
+    type == "assistant" 레코드의 content 배열 내 type == "tool_use" 항목을 모두 합산한다.
+
+    Args:
+        filepath: JSONL 파일 경로
+
+    Returns:
+        tool_use 항목 총 개수. 파일 없거나 파싱 실패 시 -1 반환 (비차단 원칙).
+    """
+    if not os.path.isfile(filepath):
+        return -1
+
+    count = 0
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if rec.get("type") != "assistant":
+                    continue
+
+                content = rec.get("content")
+                if not isinstance(content, list):
+                    continue
+
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "tool_use":
+                        count += 1
+    except Exception:
+        return -1
+
+    return count
+
+
 # =============================================================================
 # track: 개별 에이전트 종료 시 증분 추적
 # =============================================================================
@@ -228,7 +283,7 @@ def cmd_track() -> None:
     transcript_path = input_data.get("agent_transcript_path", "")
     main_transcript_path = input_data.get("transcript_path", "")
 
-    agent_type = _normalize_agent_type(agent_type)
+    agent_type, model_suffix = _normalize_agent_type(agent_type)
 
     if agent_type not in VALID_AGENT_TYPES:
         sys.exit(0)
@@ -241,11 +296,27 @@ def cmd_track() -> None:
 
     # JSONL 파싱
     tokens = parse_jsonl_usage(transcript_path)
+
+    # Hallucination 감지: tool_use 0건 && 대상 에이전트 타입 && 로거 활성
+    tool_use_count = count_tool_use_in_jsonl(transcript_path)
+    if (
+        tool_use_count == 0
+        and agent_type in HALLU_TARGET_AGENT_TYPES
+        and HOOK_HALLUCINATION_LOGGER == "true"
+    ):
+        hallu_work_dir = work_dir
+        _append_log(
+            hallu_work_dir,
+            "WARN",
+            f"HALLUCINATION_SUSPECT: agent_type={agent_type} agent_id={agent_id} tool_use_count=0",
+        )
+
     if not tokens:
         print(f"[usage-sync] No valid usage data found in: {transcript_path}", file=sys.stderr)
         sys.exit(0)
 
     tokens["method"] = "subagent_transcript"
+    tokens["model"] = model_suffix if model_suffix else "default"
 
     usage_file = os.path.join(work_dir, "usage.json")
     lock_dir = usage_file + ".lockdir"
@@ -466,7 +537,7 @@ def _resolve_agent_type(agent_filename: str, agent_map: dict[str, str]) -> Optio
                     continue
                 if rec.get("type") == "user":
                     slug = rec.get("slug", "")
-                    normalized = _normalize_agent_type(slug)
+                    normalized, _suffix = _normalize_agent_type(slug)
                     if normalized in VALID_AGENT_TYPES:
                         return normalized
                     break

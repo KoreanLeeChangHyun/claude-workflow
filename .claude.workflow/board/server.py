@@ -462,6 +462,7 @@ class TerminalSSEChannel:
         Returns:
             result 페이로드 dict
         """
+        usage = data.get('usage', {})
         return {
             'kind': 'result',
             'done': True,
@@ -471,6 +472,10 @@ class TerminalSSEChannel:
             'duration_ms': data.get('duration_ms', 0),
             'session_id': data.get('session_id', ''),
             'cost_usd': data.get('total_cost_usd', 0),
+            'input_tokens': usage.get('input_tokens', 0)
+                + usage.get('cache_read_input_tokens', 0)
+                + usage.get('cache_creation_input_tokens', 0),
+            'output_tokens': usage.get('output_tokens', 0),
         }
 
     def _build_system_payload(self, data: dict) -> dict:
@@ -523,15 +528,20 @@ class ClaudeProcess:
         """
         self._process: subprocess.Popen | None = None
         self._session_id: str = ''
+        self._model: str = ''
+        self._permission_mode: str = ''
         self._status: str = 'stopped'
         self._stdin_lock: threading.Lock = threading.Lock()
         self._stdout_thread: threading.Thread | None = None
         self._channel: TerminalSSEChannel = channel
+        self._init_event: threading.Event = threading.Event()
 
     def spawn(self, extra_args: list[str] | None = None) -> dict:
         """Claude CLI 프로세스를 시작한다.
 
         이미 실행 중인 프로세스가 있으면 먼저 종료한다.
+        프로세스 시작 후 system/init SSE 이벤트를 최대 10초까지 대기하여
+        session_id를 응답에 포함한다.
 
         Args:
             extra_args: 추가 CLI 인자 목록 (선택적)
@@ -541,17 +551,25 @@ class ClaudeProcess:
         """
         if self._process and self._process.poll() is None:
             self.kill()
+            self._init_event.clear()
 
+        # 이전 stdout 스레드가 완전히 종료될 때까지 대기
+        if self._stdout_thread and self._stdout_thread.is_alive():
+            self._stdout_thread.join(timeout=3)
+
+        # stdin 대기 모드로 시작: --print와 -p '' 제거
+        # --input-format stream-json만 사용하면 Claude는 stdin에서 NDJSON 입력을 대기한다
         cmd = [
             'claude',
-            '--print',
             '--output-format', 'stream-json',
             '--input-format', 'stream-json',
+            '--include-partial-messages',
             '--verbose',
-            '-p', '',
         ]
         if extra_args:
             cmd.extend(extra_args)
+
+        self._init_event.clear()
 
         try:
             self._process = subprocess.Popen(
@@ -587,6 +605,8 @@ class ClaudeProcess:
             name='claude-stdout-reader',
         )
         self._stdout_thread.start()
+
+        # init 대기 없이 즉시 응답 — SSE로 init 이벤트가 전달됨
 
         return {
             'ok': True,
@@ -701,12 +721,15 @@ class ClaudeProcess:
                     logger.debug('Non-JSON stdout line: %s', stripped[:200])
                     continue
 
-                # system/init에서 session_id 추출
+                # system/init에서 session_id 추출 후 init 대기 이벤트 해제
                 if (
                     data.get('type') == 'system'
                     and data.get('subtype') == 'init'
                 ):
                     self._session_id = data.get('session_id', '')
+                    self._model = data.get('model', '')
+                    self._permission_mode = data.get('permissionMode', '')
+                    self._init_event.set()
 
                 # result 수신 시 상태를 idle로 전환
                 if data.get('type') == 'result':
@@ -1180,6 +1203,17 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
                 'pid': SERVER_PID,
                 'started_at': SERVER_STARTED_AT,
             })
+        elif path == '/api/branch':
+            try:
+                result = subprocess.run(
+                    ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                    capture_output=True, text=True, timeout=3,
+                    cwd=project_root,
+                )
+                branch = result.stdout.strip() if result.returncode == 0 else ''
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                branch = ''
+            self._send_json({'branch': branch})
         else:
             self.send_response(404)
             self.end_headers()
@@ -1274,6 +1308,8 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
         self._send_json({
             'status': claude_process.status,
             'session_id': claude_process.session_id,
+            'model': claude_process._model,
+            'permission_mode': claude_process._permission_mode,
             'clients': terminal_sse_channel.client_count,
         })
 
@@ -1422,13 +1458,15 @@ def _run_server(project_root: str) -> None:
     port = resolve_port(project_root)
 
     url_file = os.path.join(project_root, '.claude.workflow', '.board.url')
+    terminal_url_file = os.path.join(project_root, '.claude.workflow', '.terminal.url')
 
     def _cleanup_runtime_files() -> None:
-        """런타임 파일 .claude.workflow/.board.url을 삭제한다."""
-        try:
-            os.remove(url_file)
-        except OSError:
-            pass
+        """런타임 파일 .claude.workflow/.board.url, .terminal.url을 삭제한다."""
+        for f in (url_file, terminal_url_file):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
     def _signal_handler(signum: int, frame: object) -> None:
         """SIGTERM/SIGINT 수신 시 Claude 프로세스와 런타임 파일을 정리하고 종료한다."""
@@ -1442,8 +1480,11 @@ def _run_server(project_root: str) -> None:
 
     # 런타임 파일 생성 (디렉터리가 없으면 먼저 생성)
     os.makedirs(os.path.dirname(url_file), exist_ok=True)
+    base = f'http://127.0.0.1:{port}/.claude.workflow/board'
     with open(url_file, 'w') as f:
-        f.write(f'http://127.0.0.1:{port}/.claude.workflow/board/index.html')
+        f.write(f'{base}/index.html\n{base}/terminal.html')
+    with open(terminal_url_file, 'w') as f:
+        f.write(f'{base}/terminal.html')
 
     # FileWatcher 시작
     def on_change(event_type: str, files: list[str]) -> None:
@@ -1484,12 +1525,13 @@ def main() -> int:
         try:
             from urllib.parse import urlparse
             with open(url_file) as f:
-                recorded_url = f.read().strip()
+                recorded_url = f.read().strip().split('\n')[0]
             recorded_port = urlparse(recorded_url).port
             if recorded_port and is_port_in_use(recorded_port):
                 # 서버가 이미 실행 중 — URL 파일만 갱신
+                base = f'http://127.0.0.1:{recorded_port}/.claude.workflow/board'
                 with open(url_file, 'w') as f:
-                    f.write(f'http://127.0.0.1:{recorded_port}/.claude.workflow/board/index.html')
+                    f.write(f'{base}/index.html\n{base}/terminal.html')
                 return 0
             else:
                 # stale 파일: 포트가 비활성 상태이므로 파일 삭제 후 새로 시작
