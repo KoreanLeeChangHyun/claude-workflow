@@ -10,7 +10,8 @@
 .claude.workflow/worktrees/
 .claude.workflow/dashboard/
 .claude.workflow/.board.url
-.claude.workflow/.terminal.url
+.claude.workflow/.sessions/
+.claude/scheduled_tasks.lock
 
 CLAUDE.md
 

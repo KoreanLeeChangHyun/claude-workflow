@@ -5,6 +5,10 @@
 - 사용자가 직접 수정을 명시 요청한 경우에만 메인 세션에서 직접 수정
 - 메인 세션은 기본적으로 티켓 관리·상태 확인·결과 리뷰 등 조율 역할 담당
 - 자연어 요청도 워크플로우 명령으로 변환하여 처리 (아래 natural-language-mapping 참조)
+- 티켓 생성 시 대화 맥락에서 관련 티켓이 있으면 `flow-kanban link`로 관계를 자동 연결한다 (SHOULD)
+  - 기존 티켓 실행 중 발견된 버그/이슈 → `--derived-from` (파생)
+  - 선행 작업이 필요한 경우 → `--depends-on` (의존)
+  - 후속 작업을 차단하는 경우 → `--blocks` (차단)
 
 ## DO NOT
 - PreToolUse Hook 활성 시 직접 수정 시도하지 않는다 — 차단되므로 토큰 낭비
@@ -40,7 +44,6 @@ create, move, done, delete, update-title, update, update-prompt, update-result, 
 > `\n`이 누락되면 XML 래핑이 실패하여 태그 직후에 텍스트가 붙는 형식 오류가 발생한다.
 
 ### 기타 alias
-- flow-tmux: launch, cleanup
 - flow-claude: start, end
 - flow-update: status, both, task-start, task-status, context, link-session, usage-pending, usage, usage-finalize, env
 - flow-finish: (registryKey 완료|실패 --ticket-number T-NNN)

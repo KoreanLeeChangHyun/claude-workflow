@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -26,7 +27,7 @@ _scripts_dir: str = os.path.normpath(
 if _scripts_dir not in sys.path:
     sys.path.insert(0, _scripts_dir)
 
-from flow.tmux_utils import WINDOW_PREFIX_P
+from flow.session_identifier import WINDOW_PREFIX_P
 
 
 # ---------------------------------------------------------------------------
@@ -34,26 +35,58 @@ from flow.tmux_utils import WINDOW_PREFIX_P
 # ---------------------------------------------------------------------------
 
 def _handle_bash_flow_end(tool_input: dict) -> None:
-    """Handle tmux window cleanup when flow-claude end is detected.
+    """Handle session cleanup when flow-claude end is detected.
 
     Detects 'flow-claude end' pattern in Bash command input and schedules
-    a delayed tmux kill-window as a secondary safety net (2nd layer after
+    a delayed session kill as a secondary safety net (2nd layer after
     finalization.py Step 5). Uses a 5-second delay (longer than
     finalization.py's 3 seconds) to ensure banner output completes first.
 
-    Conditions required to trigger cleanup:
-        1. TMUX_PANE environment variable is set.
-        2. Current tmux window name starts with 'P:T-'.
+    HTTP API path (primary):
+        Uses _WF_SESSION_ID + _WF_SERVER_PORT environment variables to call
+        POST /terminal/workflow/kill via a background subprocess with 5s delay.
 
-    If any condition is unmet, cleanup is silently skipped (idempotent).
+    TMUX fallback path (legacy):
+        When _WF_SESSION_ID or _WF_SERVER_PORT is absent, falls back to the
+        original TMUX_PANE-based tmux kill-window approach.
+
+    If any required condition is unmet, cleanup is silently skipped (idempotent).
 
     Args:
         tool_input: The tool_input dict from the Bash hook payload.
     """
     command: str = tool_input.get('command', '') if isinstance(tool_input, dict) else ''
-    if 'flow-claude end' not in command:
+    # 명령어 시작 위치(줄 시작 또는 ; && || & 뒤)에서만 매칭 —
+    # 주석/문자열 리터럴/heredoc 내부의 'flow-claude end' 오탐 방지
+    if not re.search(r'(?:^|[;&|]\s*)flow-claude\s+end\b', command):
         return
 
+    session_id: str | None = os.environ.get('_WF_SESSION_ID')
+    server_port: str | None = os.environ.get('_WF_SERVER_PORT')
+
+    if session_id and server_port:
+        # HTTP API path: 5초 지연 후 POST /terminal/workflow/kill (백그라운드)
+        port = server_port
+        sid = session_id
+        python_cmd = (
+            f"import time,urllib.request,json; "
+            f"time.sleep(5); "
+            f"urllib.request.urlopen("
+            f"urllib.request.Request("
+            f"'http://127.0.0.1:{port}/terminal/workflow/kill', "
+            f"data=json.dumps({{'session_id':'{sid}'}}).encode(), "
+            f"headers={{'Content-Type':'application/json'}}, "
+            f"method='POST'))"
+        )
+        subprocess.Popen(
+            ['python3', '-c', python_cmd],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return
+
+    # TMUX fallback: _WF_SESSION_ID 또는 _WF_SERVER_PORT 미설정 시 기존 tmux 경로 유지
     tmux_pane: str | None = os.environ.get('TMUX_PANE')
     if not tmux_pane:
         return

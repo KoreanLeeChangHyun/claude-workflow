@@ -4,170 +4,121 @@
  * Board SPA terminal tab module.
  *
  * Provides a web-based terminal UI for interacting with Claude Code via
- * NDJSON stream-json protocol. Manages xterm.js terminal instance,
- * SSE event stream for real-time output, session lifecycle (start/kill),
- * and user input submission.
+ * NDJSON stream-json protocol. Uses HTML div-based output renderer with
+ * marked.js for markdown rendering. Manages SSE event stream for real-time
+ * output, session lifecycle (start/kill), and user input submission.
  *
  * Depends on: common.js (Board.state, Board.util, Board.render)
+ * Optional:   marked.js (CDN, fallback to plain text if unavailable)
  */
 "use strict";
 
 (function () {
   var esc = Board.util.esc;
 
-  // ── Markdown Renderer ──
+  // ── Markdown Renderer (marked.js wrapper with fallback) ──
 
-  function renderMarkdown(text) {
-    var lines = text.split("\n");
-    var out = [];
-    var inCodeBlock = false;
-    var codeBlockLang = "";
-    var i = 0;
+  /**
+   * Configures marked.js with custom renderer for terminal-specific HTML output.
+   * Falls back to plain text in <pre> if marked.js is unavailable.
+   */
+  function initMarked() {
+    if (typeof marked === "undefined") return;
 
-    while (i < lines.length) {
-      var line = lines[i];
+    marked.use({
+      breaks: true,
+      gfm: true,
+      renderer: {
+        code: function (token) {
+          var text = token.text;
+          var lang = token.lang;
+          var langLabel = lang ? esc(lang) : "code";
+          var highlighted = "";
+          // Try highlight.js for syntax coloring
+          if (typeof hljs !== "undefined" && lang && hljs.getLanguage(lang)) {
+            try {
+              highlighted = hljs.highlight(text, { language: lang }).value;
+            } catch (e) {
+              highlighted = "";
+            }
+          }
+          if (!highlighted) {
+            highlighted = token.escaped ? text : esc(text);
+          }
+          return '<pre class="term-code-block"><span class="term-code-lang">' + langLabel + '</span><code class="lang-' + esc(lang || "") + '">' + highlighted + '</code></pre>';
+        },
 
-      // Code block toggle
-      if (line.match(/^```/)) {
-        if (!inCodeBlock) {
-          inCodeBlock = true;
-          codeBlockLang = line.slice(3).trim();
-          out.push("\x1b[90m" + (codeBlockLang ? "  " + codeBlockLang : "  code") + "\x1b[0m");
-          out.push("\x1b[90m" + repeat("─", 40) + "\x1b[0m");
-        } else {
-          inCodeBlock = false;
-          out.push("\x1b[90m" + repeat("─", 40) + "\x1b[0m");
+        codespan: function (token) {
+          return '<code class="term-inline-code">' + token.text + '</code>';
+        },
+
+        heading: function (token) {
+          var depth = token.depth;
+          return '<h' + depth + ' class="term-heading">' + token.text + '</h' + depth + '>';
+        },
+
+        table: function (token) {
+          // v5: header is TableCell[], rows is TableCell[][]
+          // Each cell has .text (pre-rendered inline HTML string)
+          var header = "";
+          for (var i = 0; i < token.header.length; i++) {
+            header += '<th>' + token.header[i].text + '</th>';
+          }
+          var body = "";
+          for (var r = 0; r < token.rows.length; r++) {
+            var row = token.rows[r];
+            var cells = "";
+            for (var c = 0; c < row.length; c++) {
+              cells += '<td>' + row[c].text + '</td>';
+            }
+            body += '<tr>' + cells + '</tr>';
+          }
+          return '<table class="term-table"><thead><tr>' + header + '</tr></thead><tbody>' + body + '</tbody></table>';
+        },
+
+        list: function (token) {
+          // v5: token.items is ListItem[]; each item has .text (rendered inline HTML)
+          var tag = token.ordered ? "ol" : "ul";
+          var body = "";
+          for (var i = 0; i < token.items.length; i++) {
+            body += '<li>' + token.items[i].text + '</li>';
+          }
+          return '<' + tag + ' class="term-list">' + body + '</' + tag + '>';
+        },
+
+        paragraph: function (token) {
+          return '<p class="term-para">' + token.text + '</p>';
+        },
+
+        link: function (token) {
+          var t = token.title ? ' title="' + esc(token.title) + '"' : '';
+          return '<a href="' + esc(token.href) + '"' + t + ' target="_blank" rel="noopener">' + token.text + '</a>';
         }
-        i++;
-        continue;
       }
-
-      if (inCodeBlock) {
-        out.push("\x1b[36m  " + line + "\x1b[0m");
-        i++;
-        continue;
-      }
-
-      // Markdown table detection
-      if (isTableRow(line) && i + 1 < lines.length && isTableSep(lines[i + 1])) {
-        var tableLines = [];
-        while (i < lines.length && (isTableRow(lines[i]) || isTableSep(lines[i]))) {
-          tableLines.push(lines[i]);
-          i++;
-        }
-        out.push(renderTable(tableLines));
-        continue;
-      }
-
-      // Headers
-      var hMatch = line.match(/^(#{1,3})\s+(.*)/);
-      if (hMatch) {
-        out.push("\x1b[1m\x1b[36m" + hMatch[2] + "\x1b[0m");
-        i++;
-        continue;
-      }
-
-      // List items
-      if (line.match(/^\s*[-*]\s/)) {
-        out.push(line.replace(/^(\s*)[-*]\s/, "$1• "));
-        i++;
-        continue;
-      }
-
-      // Inline formatting
-      out.push(formatInline(line));
-      i++;
-    }
-
-    return out.join("\r\n");
+    });
   }
 
-  function formatInline(line) {
-    // Bold **text**
-    line = line.replace(/\*\*([^*]+)\*\*/g, "\x1b[1m$1\x1b[22m");
-    // Italic *text*
-    line = line.replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, "\x1b[3m$1\x1b[23m");
-    // Inline code `text`
-    line = line.replace(/`([^`]+)`/g, "\x1b[46m\x1b[30m $1 \x1b[0m");
-    return line;
-  }
-
-  function isTableRow(line) {
-    return line && line.trim().charAt(0) === "|" && line.trim().slice(-1) === "|";
-  }
-
-  function isTableSep(line) {
-    return line && /^\|[\s:?-]+\|/.test(line.trim());
-  }
-
-  function repeat(ch, n) {
-    var s = "";
-    for (var j = 0; j < n; j++) s += ch;
-    return s;
-  }
-
-  function renderTable(tableLines) {
-    // Parse cells
-    var rows = [];
-    var sepIdx = -1;
-    for (var i = 0; i < tableLines.length; i++) {
-      if (isTableSep(tableLines[i])) {
-        sepIdx = i;
-        continue;
-      }
-      var cells = tableLines[i].split("|").slice(1, -1);
-      for (var c = 0; c < cells.length; c++) cells[c] = cells[c].trim();
-      rows.push(cells);
-    }
-
-    if (rows.length === 0) return "";
-
-    // Calculate column widths
-    var cols = rows[0].length;
-    var widths = [];
-    for (var c = 0; c < cols; c++) widths[c] = 0;
-    for (var r = 0; r < rows.length; r++) {
-      for (var c = 0; c < cols && c < rows[r].length; c++) {
-        var w = stripAnsi(rows[r][c]).length;
-        if (w > widths[c]) widths[c] = w;
+  /**
+   * Parses markdown text to HTML using marked.js.
+   * Falls back to escaped text in <pre> if marked.js is not loaded.
+   * @param {string} text - markdown text
+   * @returns {string} HTML string
+   */
+  function renderMarkdownToHtml(text) {
+    if (typeof marked !== "undefined" && marked.parse) {
+      try {
+        return marked.parse(text);
+      } catch (e) {
+        // marked.js parse failure — fallback
       }
     }
-
-    // Render with box-drawing
-    var out = [];
-    // Top border
-    out.push("\x1b[90m┌" + widths.map(function (w) { return repeat("─", w + 2); }).join("┬") + "┐\x1b[0m");
-
-    for (var r = 0; r < rows.length; r++) {
-      var row = [];
-      for (var c = 0; c < cols; c++) {
-        var cell = (rows[r][c] || "");
-        var pad = widths[c] - stripAnsi(cell).length;
-        row.push(" " + cell + repeat(" ", pad) + " ");
-      }
-      if (r === 0) {
-        // Header row — bold
-        out.push("\x1b[90m│\x1b[0m\x1b[1m" + row.join("\x1b[0m\x1b[90m│\x1b[0m\x1b[1m") + "\x1b[0m\x1b[90m│\x1b[0m");
-        out.push("\x1b[90m├" + widths.map(function (w) { return repeat("─", w + 2); }).join("┼") + "┤\x1b[0m");
-      } else {
-        out.push("\x1b[90m│\x1b[0m" + row.join("\x1b[90m│\x1b[0m") + "\x1b[90m│\x1b[0m");
-      }
-    }
-
-    // Bottom border
-    out.push("\x1b[90m└" + widths.map(function (w) { return repeat("─", w + 2); }).join("┴") + "┘\x1b[0m");
-
-    return out.join("\r\n");
-  }
-
-  function stripAnsi(s) {
-    return s.replace(/\x1b\[[0-9;]*m/g, "");
+    // Fallback: plain text in <pre>
+    return '<pre class="term-fallback">' + esc(text) + '</pre>';
   }
 
   // ── Constants ──
   var SSE_RECONNECT_INTERVAL = 3000;  // SSE reconnect delay (ms)
-  var XTERM_CDN_CHECK_INTERVAL = 200; // xterm.js CDN load check interval (ms)
-  var XTERM_CDN_MAX_WAIT = 10000;     // max wait for xterm.js CDN (ms)
+  var MAX_OUTPUT_NODES = 10000;       // max child nodes in output div
 
   var TOOL_ICONS = {
     Bash: "\u2699",       // ⚙
@@ -186,15 +137,58 @@
   // Default icon for unknown tools
   var DEFAULT_TOOL_ICON = "\u25c8"; // ◈
 
+  // ── Session dispatcher ──
+  // Query param `?session=wf-T-NNN-...` routes all endpoints to the workflow
+  // session variants. Absence (or `?session=main`) uses the default single
+  // claude_process endpoints.
+  var workflowSessionId = (function () {
+    try {
+      var p = new URLSearchParams(window.location.search);
+      var s = p.get("session");
+      if (s && s !== "main" && s.indexOf("wf-") === 0) return s;
+    } catch (e) {}
+    return null;
+  })();
+  var isWorkflowMode = workflowSessionId !== null;
+
+  /**
+   * Returns endpoint URLs for the current session mode.
+   * @returns {{events:string, input:string, kill:string, status:string, inputBody:function(Object):Object}}
+   */
+  function endpoints() {
+    if (isWorkflowMode) {
+      var sid = encodeURIComponent(workflowSessionId);
+      return {
+        events: "/terminal/workflow/events?session_id=" + sid,
+        input: "/terminal/workflow/input",
+        kill: "/terminal/workflow/kill",
+        status: "/terminal/workflow/status?session_id=" + sid,
+        inputBody: function (extra) {
+          var b = { session_id: workflowSessionId };
+          for (var k in extra) if (extra.hasOwnProperty(k)) b[k] = extra[k];
+          return b;
+        },
+      };
+    }
+    return {
+      events: "/terminal/events",
+      input: "/terminal/input",
+      kill: "/terminal/kill",
+      status: "/terminal/status",
+      inputBody: function (extra) { return extra; },
+    };
+  }
+
   // ── State ──
   Board.state.termConnected = false;
-  Board.state.termSessionId = null;
-  Board.state.termStatus = "stopped"; // running | idle | stopped
+  Board.state.termSessionId = isWorkflowMode ? workflowSessionId : null;
+  // In workflow mode the session is already running (started by launcher)
+  Board.state.termStatus = isWorkflowMode ? "running" : "stopped"; // running | idle | stopped
 
-  /** @type {Terminal|null} xterm.js instance */
-  var term = null;
-  /** @type {FitAddon|null} xterm.js fit addon */
-  var fitAddon = null;
+  /** @type {HTMLElement|null} output div reference */
+  var outputDiv = null;
+  /** @type {HTMLElement|null} current tool box <details> element for tool result insertion */
+  var currentToolBox = null;
   /** @type {EventSource|null} SSE connection */
   var termEventSource = null;
   /** @type {number|null} SSE reconnect timer */
@@ -215,34 +209,1577 @@
   var sessionModel = '--';
   /** @type {number} context window size */
   var contextWindow = 1000000;
-  /** @type {number|null} loading spinner interval */
-  var spinnerInterval = null;
-  var spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-  var spinnerIdx = 0;
+
+  // ── Output Div Management ──
+
+  /**
+   * Initializes the HTML div output container.
+   * Sets up #terminal-output as a scrollable div and inserts initial messages.
+   */
+  function initOutputDiv() {
+    outputDiv = document.getElementById("terminal-output");
+    if (!outputDiv) return;
+
+    outputDiv.innerHTML = "";
+    if (isWorkflowMode) {
+      appendSystemMessage("Workflow Session: " + workflowSessionId);
+      appendSystemMessage("Connecting to live stream...");
+    } else {
+      appendSystemMessage("Claude Code Terminal");
+      appendSystemMessage('Press "Start" to begin a session.');
+    }
+
+    // Configure marked.js
+    initMarked();
+  }
+
+  // ── Smart Auto-Scroll ──
+  var SCROLL_NEAR_BOTTOM_THRESHOLD = 100; // px — "하단 근처" 허용 범위
+
+  /**
+   * Returns true if the element's scroll position is within THRESHOLD px of bottom.
+   * Must be called BEFORE appending new content (post-append scrollHeight is larger).
+   * @param {HTMLElement} el
+   * @returns {boolean}
+   */
+  function isNearBottom(el) {
+    if (!el) return true;
+    return (el.scrollHeight - el.scrollTop - el.clientHeight) <= SCROLL_NEAR_BOTTOM_THRESHOLD;
+  }
+
+  /**
+   * Scrolls element to bottom only if it was near the bottom before the append.
+   * @param {HTMLElement} el
+   * @param {boolean} wasNearBottom — snapshot taken before content mutation
+   */
+  function scrollToBottomIfFollowing(el, wasNearBottom) {
+    if (el && wasNearBottom) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }
+
+  /**
+   * Appends an HTML element to the output div and auto-scrolls to bottom.
+   * Enforces MAX_OUTPUT_NODES limit by removing oldest children.
+   * @param {HTMLElement} el - DOM element to append
+   */
+  function appendToOutput(el) {
+    if (!outputDiv) return;
+
+    var follow = isNearBottom(outputDiv);
+
+    // Enforce node limit
+    while (outputDiv.childNodes.length >= MAX_OUTPUT_NODES) {
+      outputDiv.removeChild(outputDiv.firstChild);
+    }
+
+    outputDiv.appendChild(el);
+    scrollToBottomIfFollowing(outputDiv, follow);
+  }
+
+  /**
+   * Appends an HTML string as a div to the output.
+   * @param {string} html - HTML content
+   * @param {string} [className] - optional CSS class for the wrapper div
+   */
+  function appendHtmlBlock(html, className) {
+    var div = document.createElement("div");
+    if (className) div.className = className;
+    div.innerHTML = html;
+    appendToOutput(div);
+  }
+
+  /**
+   * Appends a system message to the output div.
+   * @param {string} text - plain text message
+   */
+  function appendSystemMessage(text) {
+    var div = document.createElement("div");
+    div.className = "term-system";
+    div.textContent = text;
+    appendToOutput(div);
+  }
+
+  /**
+   * Appends an error message to the output div.
+   * @param {string} text - plain text error message
+   */
+  function appendErrorMessage(text) {
+    var div = document.createElement("div");
+    div.className = "term-error";
+    div.textContent = text;
+    appendToOutput(div);
+  }
+
+  // ── Tool Result Renderer ──
+
+  /**
+   * ToolResultRenderer namespace.
+   * Provides utility functions and renderer registry for tool output rendering.
+   * Renderers (util.*, dispatch) are populated here (util) and in W02-W05.
+   */
+  var ToolResultRenderer = { util: {}, renderers: {}, dispatch: null };
+
+  /**
+   * Byte threshold above which tool result HTML is auto-collapsed into <details>.
+   * @const {number}
+   */
+  var AUTO_COLLAPSE_BYTES = 2048;
+
+  /**
+   * Regex patterns for stripping LLM-injected meta text from tool results.
+   * @const {Array<RegExp>}
+   */
+  var LLM_META_PATTERNS = [
+    /^REMINDER:.*$/gm,
+    /Please proceed with the current tasks.*$/gm,
+    /Ensure that you continue to use the todo list.*$/gm,
+    /<system-reminder>[\s\S]*?<\/system-reminder>/g,
+  ];
+
+  /**
+   * Strips LLM-injected meta text (REMINDER, system-reminder tags, etc.) from raw text.
+   * Normalises consecutive blank lines to at most two newlines.
+   * @param {string} text - raw tool result text
+   * @returns {string} cleaned text
+   */
+  ToolResultRenderer.util.stripLlmMeta = function (text) {
+    if (!text) return text;
+    var cleaned = text;
+    for (var i = 0; i < LLM_META_PATTERNS.length; i++) {
+      cleaned = cleaned.replace(LLM_META_PATTERNS[i], "");
+    }
+    // Normalise 3+ consecutive blank lines to 2
+    cleaned = cleaned.replace(/\n{3,}/g, "\n\n");
+    return cleaned;
+  };
+
+  /**
+   * Wraps htmlContent in a collapsible <details> when rawByteLen exceeds AUTO_COLLAPSE_BYTES.
+   * @param {string} htmlContent - already-rendered HTML string
+   * @param {number} rawByteLen - byte length of the original raw text (for threshold check)
+   * @param {string} summary - label text for the <summary> element
+   * @returns {string} HTML string (collapsed or plain)
+   */
+  ToolResultRenderer.util.autoCollapse = function (htmlContent, rawByteLen, summary) {
+    if (rawByteLen > AUTO_COLLAPSE_BYTES) {
+      return (
+        '<details class="term-result-collapse">' +
+        '<summary>' + esc(summary) + ' (' + rawByteLen + ' bytes)</summary>' +
+        htmlContent +
+        '</details>'
+      );
+    }
+    return htmlContent;
+  };
+
+  /**
+   * Replaces well-known identifier patterns in already-escaped HTML text with
+   * clickable <a> spans carrying data-kind and data-id attributes.
+   * Must be called on text that has already been HTML-escaped (no raw user HTML).
+   * @param {string} escapedText - HTML-escaped text
+   * @returns {string} text with ID patterns wrapped in anchor tags
+   */
+  ToolResultRenderer.util.linkifyIds = function (escapedText) {
+    if (!escapedText) return escapedText;
+
+    // ticket_id: T-NNN or T-NNNN
+    var result = escapedText.replace(/\bT-(\d{3,4})\b/g, function (_, id) {
+      return '<a class="term-id-link" data-kind="ticket_id" data-id="T-' + id + '">T-' + id + '</a>';
+    });
+
+    // task_id field: task_id: "abc123" or task_id: abc123
+    result = result.replace(/task_id["']?\s*:\s*["']?([a-z0-9]{6,12})/g, function (match, id) {
+      return match.replace(id, '<a class="term-id-link" data-kind="task_id" data-id="' + id + '">' + id + '</a>');
+    });
+
+    // job_id: job_id / job id pattern
+    result = result.replace(/job[_\s]([a-z0-9]{8,})/g, function (match, id) {
+      return match.replace(id, '<a class="term-id-link" data-kind="job_id" data-id="' + id + '">' + id + '</a>');
+    });
+
+    // Cron one-shot: "Scheduled one-shot task <id>"
+    result = result.replace(/Scheduled one-shot task ([a-z0-9]{8})/g, function (match, id) {
+      return match.replace(id, '<a class="term-id-link" data-kind="cron_job_id" data-id="' + id + '">' + id + '</a>');
+    });
+
+    return result;
+  };
+
+  /**
+   * Re-exposes Board.util.esc as a single import point for all sub-renderers.
+   * @param {string} s - string to HTML-escape
+   * @returns {string} escaped string
+   */
+  ToolResultRenderer.util.safeEsc = function (s) {
+    return esc(s);
+  };
+
+  // ── Renderers: statusBadge ──
+
+  /**
+   * Renders a single-line confirmation message as an inline badge.
+   * Target tools: Write, Edit, CronCreate, CronDelete, TodoWrite,
+   *               Bash(1-line && < 200 bytes), CronList("No scheduled jobs.")
+   * @param {string} text - stripped, 1-line text (< 200 chars expected)
+   * @param {object} [meta] - reserved, unused
+   * @returns {string} HTML string
+   */
+  ToolResultRenderer.renderers.statusBadge = function (text, meta) {
+    var safeEsc = ToolResultRenderer.util.safeEsc;
+    var linkifyIds = ToolResultRenderer.util.linkifyIds;
+
+    var trimmed = (text || "").trim();
+    if (!trimmed) {
+      return '<span class="term-status-badge">(empty response)</span>';
+    }
+
+    // Replace line breaks with <br> for 2-line edge cases
+    var escaped = safeEsc(trimmed).replace(/\n/g, "<br>");
+    return '<span class="term-status-badge">' + linkifyIds(escaped) + "</span>";
+  };
+
+  // ── Renderers: fallbackPlain ──
+
+  /**
+   * Fallback renderer: wraps text in a <pre> block with HTML escaping.
+   * Strips ANSI colour codes before rendering.
+   * Target tools: unmapped tools, Bash (multi-line), Grep (content mode)
+   * @param {string} text - any text
+   * @param {object} [meta] - reserved, unused
+   * @returns {string} HTML string
+   */
+  ToolResultRenderer.renderers.fallbackPlain = function (text, meta) {
+    var safeEsc = ToolResultRenderer.util.safeEsc;
+    var linkifyIds = ToolResultRenderer.util.linkifyIds;
+
+    // Strip ANSI colour escape sequences
+    var cleaned = (text || "").replace(/\x1b\[[0-9;]*m/g, "");
+    var escaped = safeEsc(cleaned);
+    return '<pre class="term-plain">' + linkifyIds(escaped) + "</pre>";
+  };
+
+  // ── Renderers: list ──
+
+  /**
+   * Renders a line-separated path list as <ul> with data-path attributes.
+   * Handles "No matches found" / "No files found" by delegating to statusBadge.
+   * Target tools: Glob, Grep (files_with_matches / count modes)
+   * @param {string} text - newline-separated paths or "path:count" lines
+   * @param {object} [meta] - optional, meta.toolName for Glob/Grep distinction
+   * @returns {string} HTML string
+   */
+  ToolResultRenderer.renderers.list = function (text, meta) {
+    var safeEsc = ToolResultRenderer.util.safeEsc;
+    var linkifyIds = ToolResultRenderer.util.linkifyIds;
+    var statusBadge = ToolResultRenderer.renderers.statusBadge;
+
+    var trimmed = (text || "").trim();
+
+    // Special-case: empty-match messages delegate to statusBadge
+    if (trimmed === "No matches found" || trimmed === "No files found") {
+      return statusBadge(trimmed, meta);
+    }
+
+    var lines = trimmed.split("\n").filter(Boolean);
+
+    if (!lines.length) {
+      return statusBadge("(empty list)", meta);
+    }
+
+    var items = lines.map(function (line) {
+      // "path:count" format — wrap count part in <code>
+      var countMatch = line.match(/^(.+):(\d+)$/);
+      if (countMatch) {
+        var pathPart = countMatch[1];
+        var countPart = countMatch[2];
+        var escapedPath = safeEsc(pathPart);
+        return (
+          '<li data-path="' +
+          escapedPath +
+          '">' +
+          linkifyIds(escapedPath) +
+          ":<code>" +
+          safeEsc(countPart) +
+          "</code></li>"
+        );
+      }
+
+      // Plain path line
+      var escapedLine = safeEsc(line);
+      return (
+        '<li data-path="' +
+        escapedLine +
+        '">' +
+        linkifyIds(escapedLine) +
+        "</li>"
+      );
+    });
+
+    return '<ul class="term-path-list">' + items.join("") + "</ul>";
+  };
+
+  // ── Renderers: json ──
+
+  /**
+   * Renders JSON output with optional HTTP status badge (RemoteTrigger pattern).
+   * Falls back to fallbackPlain when JSON.parse fails.
+   * Target tools: TaskStop, RemoteTrigger
+   * @param {string} text - pure JSON string OR "HTTP NNN\n{json}" format
+   * @param {object} [meta] - reserved, unused
+   * @returns {string} HTML string
+   */
+  ToolResultRenderer.renderers.json = function (text, meta) {
+    var safeEsc = ToolResultRenderer.util.safeEsc;
+    var linkifyIds = ToolResultRenderer.util.linkifyIds;
+    var fallbackPlain = ToolResultRenderer.renderers.fallbackPlain;
+
+    var trimmed = (text || "").trim();
+    var httpBadgeHtml = "";
+    var jsonBody = trimmed;
+
+    // Detect leading "HTTP NNN" line (RemoteTrigger pattern)
+    var httpMatch = trimmed.match(/^(HTTP\s+(\d{3}))\n([\s\S]*)$/);
+    if (httpMatch) {
+      var httpLine = httpMatch[1];
+      var statusCode = parseInt(httpMatch[2], 10);
+      var statusClass = "ok";
+      if (statusCode >= 300 && statusCode < 400) {
+        statusClass = "redirect";
+      } else if (statusCode >= 400 && statusCode < 500) {
+        statusClass = "client-err";
+      } else if (statusCode >= 500) {
+        statusClass = "server-err";
+      }
+      httpBadgeHtml =
+        '<span class="term-http-badge term-http-' +
+        statusClass +
+        '">' +
+        safeEsc(httpLine) +
+        "</span>";
+      jsonBody = httpMatch[3].trim();
+    }
+
+    // Attempt JSON.parse → pretty-print
+    var parsed;
+    try {
+      parsed = JSON.parse(jsonBody);
+    } catch (e) {
+      // JSON.parse failed — delegate to fallbackPlain (full original text)
+      return fallbackPlain(text, meta);
+    }
+
+    var prettyJson = JSON.stringify(parsed, null, 2);
+    var prettyHtml =
+      '<pre class="term-json-pretty">' +
+      linkifyIds(safeEsc(prettyJson)) +
+      "</pre>";
+
+    return (
+      '<div class="term-json-result">' +
+      httpBadgeHtml +
+      prettyHtml +
+      "</div>"
+    );
+  };
+
+  // ── Renderers: fileContent ──
+
+  /**
+   * Renders Read tool output in cat -n format (line-number gutter + content).
+   * Parses lines matching /^\s*(\d+)\t(.*)$/ and builds a two-column table.
+   * Non-matching lines are placed in the content column with an empty lineNum.
+   * Target tools: Read
+   * @param {string} text - cat -n formatted text
+   * @param {object} [meta] - reserved, unused
+   * @returns {string} HTML string
+   */
+  ToolResultRenderer.renderers.fileContent = function (text, meta) {
+    var safeEsc = ToolResultRenderer.util.safeEsc;
+    var linkifyIds = ToolResultRenderer.util.linkifyIds;
+
+    var lines = (text || "").split("\n");
+    // Remove trailing empty entry caused by trailing newline
+    if (lines.length && lines[lines.length - 1] === "") {
+      lines = lines.slice(0, lines.length - 1);
+    }
+
+    var rows = lines.map(function (line) {
+      var m = line.match(/^(\s*\d+)\t(.*)$/);
+      var lineNum, lineBody;
+      if (m) {
+        lineNum = safeEsc(m[1].trim());
+        lineBody = linkifyIds(safeEsc(m[2]));
+      } else {
+        lineNum = "";
+        lineBody = linkifyIds(safeEsc(line));
+      }
+      return (
+        "<tr>" +
+        '<td class="term-line-num">' + lineNum + "</td>" +
+        '<td class="term-line-body">' + lineBody + "</td>" +
+        "</tr>"
+      );
+    });
+
+    return (
+      '<table class="term-file-content"><tbody>' +
+      rows.join("") +
+      "</tbody></table>"
+    );
+  };
+
+  // ── Renderers: markdown ──
+
+  /**
+   * Renders markdown content using the existing renderMarkdownToHtml function.
+   * Wraps the result in <div class="term-md-result">.
+   * Target tools: WebSearch, WebFetch, Agent, Task
+   * @param {string} text - markdown text (stripLlmMeta already applied by dispatch)
+   * @param {object} [meta] - reserved, unused
+   * @returns {string} HTML string
+   */
+  ToolResultRenderer.renderers.markdown = function (text, meta) {
+    // Reuse T-243 renderMarkdownToHtml — do NOT redefine or post-process with linkifyIds
+    // (marked.js handles linkification; post-processing would break link structure)
+    var mdHtml = renderMarkdownToHtml(text || "");
+    return '<div class="term-md-result">' + mdHtml + "</div>";
+  };
+
+  // ── Renderers: xmlLike ──
+
+  /**
+   * Renders XML-like structured tool output (TaskOutput, task-notification pushes).
+   * Parses <tag>value</tag> pairs into a <dl> list.
+   * The <output> tag content is preserved in a <pre> block.
+   * <task-notification> wrapper is detected and unwrapped before parsing inner tags.
+   * Falls back to fallbackPlain when no tags are matched.
+   * Target tools: TaskOutput, task-notification system messages
+   * @param {string} text - XML-like tagged text
+   * @param {object} [meta] - reserved, unused
+   * @returns {string} HTML string
+   */
+  ToolResultRenderer.renderers.xmlLike = function (text, meta) {
+    var safeEsc = ToolResultRenderer.util.safeEsc;
+    var linkifyIds = ToolResultRenderer.util.linkifyIds;
+    var fallbackPlain = ToolResultRenderer.renderers.fallbackPlain;
+
+    var source = (text || "").trim();
+
+    // W04-T2: Detect <task-notification> wrapper and unwrap inner content
+    var notifMatch = source.match(/^<task-notification>([\s\S]*?)<\/task-notification>$/i);
+    if (notifMatch) {
+      source = notifMatch[1].trim();
+    }
+
+    // Parse <tag>value</tag> pairs (non-greedy, case-insensitive tag names)
+    var tagRegex = /<([a-z][a-z0-9\-_]*)>([\s\S]*?)<\/\1>/gi;
+    var items = [];
+    var match;
+
+    while ((match = tagRegex.exec(source)) !== null) {
+      var tagName = match[1];
+      var rawValue = match[2];
+
+      var dtHtml = '<dt>' + safeEsc(tagName) + '</dt>';
+      var ddHtml;
+
+      if (tagName.toLowerCase() === 'output') {
+        // Preserve <output> block content in <pre> to maintain multi-line structure
+        ddHtml = '<dd><pre class="term-xml-output">' + safeEsc(rawValue) + '</pre></dd>';
+      } else {
+        // For status tags, attach data-status attribute for CSS colour control
+        var statusAttr = '';
+        if (tagName.toLowerCase() === 'status' || tagName.toLowerCase() === 'retrieval_status') {
+          var statusVal = rawValue.trim().toLowerCase();
+          statusAttr = ' data-status="' + safeEsc(statusVal) + '"';
+        }
+        var escapedVal = linkifyIds(safeEsc(rawValue.trim()));
+        ddHtml = '<dd' + statusAttr + '>' + escapedVal + '</dd>';
+      }
+
+      items.push(dtHtml + ddHtml);
+    }
+
+    // No tags matched — fall back to plain rendering
+    if (!items.length) {
+      return fallbackPlain(text, meta);
+    }
+
+    return '<dl class="term-xml-result">' + items.join('') + '</dl>';
+  };
+
+  // ── Renderers: schema ──
+
+  /**
+   * Renders ToolSearch output: extracts <function> JSON blocks and builds
+   * collapsed cards showing name and description for each tool.
+   * Falls back to fallbackPlain when no valid function blocks are found.
+   * Target tools: ToolSearch
+   * @param {string} text - <functions>...</functions> wrapper with <function>{json}</function> entries
+   * @param {object} [meta] - reserved, unused
+   * @returns {string} HTML string
+   */
+  ToolResultRenderer.renderers.schema = function (text, meta) {
+    var safeEsc = ToolResultRenderer.util.safeEsc;
+    var fallbackPlain = ToolResultRenderer.renderers.fallbackPlain;
+
+    var source = (text || '').trim();
+
+    // Extract individual <function>...</function> blocks
+    var funcRegex = /<function>([\s\S]*?)<\/function>/gi;
+    var cards = [];
+    var match;
+
+    while ((match = funcRegex.exec(source)) !== null) {
+      var blockText = match[1].trim();
+      var parsed;
+      try {
+        parsed = JSON.parse(blockText);
+      } catch (e) {
+        // Skip malformed JSON blocks silently
+        continue;
+      }
+
+      var name = (parsed && parsed.name) ? String(parsed.name) : '';
+      var desc = (parsed && parsed.description) ? String(parsed.description) : '';
+
+      // linkifyIds is intentionally NOT applied to schema text (schema pollution risk)
+      cards.push(
+        '<div class="term-schema-card">' +
+        '<strong class="term-schema-name">' + safeEsc(name) + '</strong>' +
+        '<p class="term-schema-desc">' + safeEsc(desc) + '</p>' +
+        '</div>'
+      );
+    }
+
+    // No valid cards extracted — fall back to plain rendering
+    if (!cards.length) {
+      return fallbackPlain(text, meta);
+    }
+
+    return (
+      '<details class="term-schema-collapse" open="">' +
+      '<summary>Functions (' + cards.length + ')</summary>' +
+      '<div class="term-schema-cards">' + cards.join('') + '</div>' +
+      '</details>'
+    );
+  };
+
+  // ── Renderers: taskStream ──
+
+  /**
+   * Renders Bash(run_in_background) output: extracts task_id and output file path
+   * from the "Command running in background with ID: ..." signature line.
+   * Falls back to fallbackPlain when the signature line is not detected.
+   * Target tools: Bash (run_in_background=true)
+   * @param {string} text - stripped text starting with background task signature
+   * @param {object} [meta] - reserved, unused
+   * @returns {string} HTML string
+   */
+  ToolResultRenderer.renderers.taskStream = function (text, meta) {
+    var safeEsc = ToolResultRenderer.util.safeEsc;
+    var fallbackPlain = ToolResultRenderer.renderers.fallbackPlain;
+
+    var source = (text || '').trim();
+
+    // Primary form: "Command running in background with ID: <id>. Output is being written to: <path>"
+    var full = source.match(/Command running in background with ID:\s*(\S+?)\.\s*Output is being written to:\s*(\S+)/);
+    var taskId = '';
+    var outputPath = '';
+
+    if (full) {
+      taskId = full[1];
+      outputPath = full[2];
+    } else {
+      // Split form: ID-only on first match line, scan remainder for output path
+      var idOnly = source.match(/Command running in background with ID:\s*(\S+)/);
+      if (!idOnly) {
+        return fallbackPlain(text, meta);
+      }
+      taskId = idOnly[1].replace(/\.+$/, '');
+      // Scan subsequent lines for a plausible output file path (e.g., /tmp/*.log)
+      var pathMatch = source.match(/(?:Output is being written to|Output file|output)[^\S\r\n]*[:\-]?\s*(\/[^\s"']+)/i);
+      if (pathMatch) {
+        outputPath = pathMatch[1];
+      } else {
+        // Last-ditch: any /tmp/... path referenced anywhere in text
+        var tmpMatch = source.match(/(\/(?:tmp|var\/log|var\/tmp)\/\S+)/);
+        if (tmpMatch) outputPath = tmpMatch[1];
+      }
+    }
+
+    if (!taskId) {
+      return fallbackPlain(text, meta);
+    }
+
+    var escapedId = safeEsc(taskId);
+    var html = '<div class="term-taskstream">' +
+      '<span class="term-task-badge">' +
+      'task <a class="term-id-link" data-kind="task_id" data-id="' + escapedId + '">' + escapedId + '</a>' +
+      '</span>';
+
+    if (outputPath) {
+      var escapedPath = safeEsc(outputPath);
+      html += '<span class="term-task-output-path">' +
+        ' &rarr; <code>' + escapedPath + '</code>' +
+        '</span>' +
+        '<button class="term-fetch-output-btn" type="button"' +
+        ' data-task-id="' + escapedId + '"' +
+        ' data-output-path="' + escapedPath + '">' +
+        'fetch output' +
+        '</button>';
+    }
+
+    html += '</div>';
+    return html;
+  };
+
+  // ── dispatch: tool → renderer routing ──
+
+  /**
+   * Tool name → renderer key mapping.
+   * "auto" values indicate content-heuristic branching inside dispatch().
+   * @const {Object<string, string>}
+   */
+  var TOOL_RENDERER_MAP = {
+    "Bash": "auto",
+    "Glob": "list",
+    "Grep": "auto",
+    "Read": "fileContent",
+    "Write": "statusBadge",
+    "Edit": "statusBadge",
+    "ToolSearch": "schema",
+    "TodoWrite": "statusBadge",
+    "WebSearch": "markdown",
+    "WebFetch": "markdown",
+    "CronList": "auto",
+    "CronCreate": "statusBadge",
+    "CronDelete": "statusBadge",
+    "TaskOutput": "xmlLike",
+    "TaskStop": "json",
+    "RemoteTrigger": "json",
+    "Agent": "markdown",
+    "Task": "markdown"
+  };
+
+  // Expose for external inspection / tests
+  ToolResultRenderer.TOOL_RENDERER_MAP = TOOL_RENDERER_MAP;
+
+  /**
+   * Resolves an "auto" mapping to a concrete renderer key based on text heuristics.
+   * @param {string} toolName
+   * @param {string} text - stripLlmMeta-cleaned text
+   * @returns {string} concrete renderer key
+   */
+  function resolveAutoRenderer(toolName, text) {
+    var t = (text || '').trim();
+
+    if (toolName === 'Bash') {
+      if (/Command running in background with ID:/.test(t)) return 'taskStream';
+      var lineCount = t.length === 0 ? 0 : t.split(/\n/).length;
+      if (lineCount === 1 && t.length < 200) return 'statusBadge';
+      return 'fallbackPlain';
+    }
+
+    if (toolName === 'Grep') {
+      if (t === 'No matches found') return 'statusBadge';
+      // content mode: file:lineno:content
+      if (/^[^:\n]+:\d+:/m.test(t)) return 'fallbackPlain';
+      // count mode: file:count  or  files_with_matches (plain paths)
+      return 'list';
+    }
+
+    if (toolName === 'CronList') {
+      if (t === 'No scheduled jobs.') return 'statusBadge';
+      return 'list';
+    }
+
+    // Unknown auto target: safest default
+    return 'fallbackPlain';
+  }
+
+  /**
+   * Dispatches tool output text to the appropriate renderer.
+   * Pipeline: stripLlmMeta → renderer resolution → renderer invocation (with fallback)
+   *           → autoCollapse → return HTML.
+   * @param {string} toolName - tool name (may be undefined/null for legacy callers)
+   * @param {string} text - raw tool result text
+   * @param {object} [meta] - optional metadata forwarded to renderer
+   * @returns {string} HTML string
+   */
+  ToolResultRenderer.dispatch = function (toolName, text, meta) {
+    var util = ToolResultRenderer.util;
+    var renderers = ToolResultRenderer.renderers;
+
+    // [1] Preprocess: strip LLM meta noise
+    var cleanText = util.stripLlmMeta(text || '');
+
+    // Compute raw byte length for autoCollapse threshold
+    var rawByteLen;
+    try {
+      rawByteLen = (typeof TextEncoder !== 'undefined')
+        ? new TextEncoder().encode(cleanText).length
+        : cleanText.length;
+    } catch (e) {
+      rawByteLen = cleanText.length;
+    }
+
+    // [2] Resolve renderer key
+    var mapped = toolName ? TOOL_RENDERER_MAP[toolName] : undefined;
+    var rendererKey;
+    if (mapped === undefined) {
+      rendererKey = 'fallbackPlain';
+    } else if (mapped === 'auto') {
+      rendererKey = resolveAutoRenderer(toolName, cleanText);
+    } else {
+      rendererKey = mapped;
+    }
+
+    // [3] Invoke renderer with fallback on runtime error
+    var htmlContent;
+    var renderFn = renderers[rendererKey] || renderers.fallbackPlain;
+    try {
+      htmlContent = renderFn(cleanText, meta);
+    } catch (e) {
+      try {
+        htmlContent = renderers.fallbackPlain(cleanText, meta);
+      } catch (e2) {
+        htmlContent = '<pre class="term-plain">' + util.safeEsc(cleanText) + '</pre>';
+      }
+    }
+
+    // [4] Post-process: wrap in collapsible <details> when oversized
+    var summary = (toolName || 'tool') + ' result';
+    return util.autoCollapse(htmlContent, rawByteLen, summary);
+  };
+
+  // ── WorkflowRenderer: ANSI strip utility ──
+
+  /**
+   * Removes ANSI SGR escape sequences from text.
+   * Banner scripts emit colour codes (e.g. \033[38;2;222;115;86m) that must be
+   * stripped before pattern matching.
+   * @param {string} text - raw text possibly containing ANSI escape codes
+   * @returns {string} text with ANSI codes removed
+   */
+  var ANSI_STRIP_RE = /\x1b\[[0-9;]*m/g;
+  function stripAnsi(text) {
+    return (text || "").replace(ANSI_STRIP_RE, "");
+  }
+
+  // ── WorkflowRenderer namespace ──
+
+  /**
+   * WorkflowRenderer namespace.
+   *
+   * Parses Bash tool_use_result text for workflow banner patterns emitted by
+   * flow-claude, flow-init, flow-step, flow-phase, and flow-finish scripts.
+   * Maintains phaseTimeline state and returns consumed=true when any banner
+   * line is detected, signalling callers to skip normal insertToolResult().
+   *
+   * This module is purely a parser + state machine (no DOM access).
+   * DOM rendering is handled by W03 (renderTimelineBar / renderStatusBadge).
+   *
+   * Only active when isWorkflowMode === true.
+   */
+  var WorkflowRenderer = (function () {
+
+    // ── Pattern constants (W01 design §1.2–1.9) ──
+
+    var P = {
+      // flow-claude start: box top border
+      workflowBoxTop:    /╔[═]+╗/,
+      // flow-claude start: ▶ command line inside box
+      workflowStartCmd:  /║\s+▶\s+(\S+)/,
+      // flow-claude end: [OK] workId · title (command)
+      workflowEnd:       /║\s+\[OK\]\s+(\S+)\s+·\s+(.+?)(?:\s+\((\w+)\))?$/,
+      // flow-claude end: trailing border line of ══ chars
+      endBorder:         /^[═]{10,}$/,
+      // flow-init: INIT title line
+      init:              /║\s+INIT:\s+(.+)$/,
+      // flow-init: workDir line (second line after INIT)
+      initWorkDir:       /║\s+(\.claude\.workflow\/workflow\/[^\s]+)$/,
+      // flow-step start: [● ○ ○] STEP_NAME inside box
+      stepStart:         /║\s+\[●[^\]]*\]\s+(PLAN|WORK|REPORT|DONE)/,
+      // flow-step end: [● ● ○] STEP_NAME - timestamp
+      stepEnd:           /║\s+\[●[^\]]*\]\s+(PLAN|WORK|REPORT|DONE)\s+-\s+(.+)$/,
+      // flow-step end artifact path line
+      artifactLine:      /║\s+(\.claude\.workflow\/workflow\/[^\s]+\.(?:md|json|txt))$/,
+      // flow-step [OK] label
+      stepOk:            /║\s+\[OK\]\s+(\S+)$/,
+      // flow-step [ASK] label
+      stepAsk:           /║\s+\[ASK\]\s+(\S+)$/,
+      // flow-phase: STATE Phase N mode
+      phase:             /║\s+STATE:\s+Phase\s+(\d+)\s+(sequential|parallel)/,
+      // flow-phase: >> agents [taskIds]
+      phaseAgents:       /║\s+>>\s+([^\[]+?)(?:\s+\[([^\]]+)\])?$/,
+      // flow-finish: DONE 완료 or 실패
+      finishDone:        /║\s+DONE:\s+워크플로우\s+(완료|실패)/,
+      // flow-finish: registryKey line
+      finishKey:         /║\s+(\d{8}-\d{6})$/,
+      // FAIL: bare FAIL line (initialization/finalization early exit)
+      fail:              /^FAIL$/
+    };
+
+    // ── Default state (mirrors W01 design §2.2) ──
+
+    var DEFAULT_STATE = {
+      command:      "",
+      workId:       "",
+      title:        "",
+      workDir:      "",
+      currentStep:  "unknown",
+      currentPhase: -1,
+      phases:       [],
+      artifacts:    [],
+      status:       "running",
+      error:        undefined
+    };
+
+    // ── Internal mutable state ──
+
+    /** @type {Object} phaseTimeline state */
+    var _state = {};
+
+    // Parser flags for multi-line banner sequences
+    /** @type {boolean} waiting for initWorkDir line after INIT line */
+    var _pendingInit = false;
+    /** @type {string} title captured from INIT line, awaiting workDir */
+    var _pendingInitTitle = "";
+
+    /** @type {boolean} waiting for artifact/ok/ask lines after stepEnd line */
+    var _pendingStepEnd = false;
+    /** @type {string} step name captured from stepEnd line */
+    var _pendingStepEndName = "";
+    /** @type {string} timestamp captured from stepEnd line */
+    var _pendingStepEndTs = "";
+
+    /** @type {boolean} waiting for phaseAgents line after phase line */
+    var _pendingPhase = false;
+    /** @type {number} phase number captured from phase line */
+    var _pendingPhaseN = -1;
+    /** @type {string} phase mode captured from phase line */
+    var _pendingPhaseMode = "";
+
+    /** @type {boolean} inside a ╔═╗ box (workflow start or step start) */
+    var _inBox = false;
+    /** @type {boolean} box seen ▶ command → confirmed workflow start (not step start) */
+    var _boxHasCmd = false;
+
+    /** @type {boolean} waiting for finishKey line after finishDone */
+    var _pendingFinish = false;
+    /** @type {string} "완료" or "실패" from finishDone */
+    var _pendingFinishResult = "";
+
+    // ── phaseTimeline state management methods ──
+
+    /**
+     * Resets state to defaults and optionally stores command.
+     * Called when a new workflow start banner (╔═╗ + ▶ command) is detected.
+     * @param {string} [command]
+     */
+    function _reset(command) {
+      _state = {
+        command:      command || "",
+        workId:       "",
+        title:        "",
+        workDir:      "",
+        currentStep:  "unknown",
+        currentPhase: -1,
+        phases:       [],
+        artifacts:    [],
+        status:       "running",
+        error:        undefined
+      };
+      _clearParserFlags();
+    }
+
+    /**
+     * Clears all multi-line parser flags.
+     */
+    function _clearParserFlags() {
+      _pendingInit = false;
+      _pendingInitTitle = "";
+      _pendingStepEnd = false;
+      _pendingStepEndName = "";
+      _pendingStepEndTs = "";
+      _pendingPhase = false;
+      _pendingPhaseN = -1;
+      _pendingPhaseMode = "";
+      _inBox = false;
+      _boxHasCmd = false;
+      _pendingFinish = false;
+      _pendingFinishResult = "";
+    }
+
+    /**
+     * Stores INIT title+workDir and sets currentStep to "init".
+     * @param {string} title
+     * @param {string} workDir
+     */
+    function _setInit(title, workDir) {
+      _state.title = title;
+      _state.workDir = workDir;
+      _state.currentStep = "init";
+    }
+
+    /**
+     * Advances currentStep to the given step name (lowercased).
+     * @param {string} stepName - "PLAN"|"WORK"|"REPORT"|"DONE"
+     */
+    function _setStep(stepName) {
+      _state.currentStep = stepName.toLowerCase();
+    }
+
+    /**
+     * Adds a new phase entry to phases[] and updates currentPhase.
+     * @param {number} n - phase number
+     * @param {string} mode - "sequential"|"parallel"
+     * @param {string[]} [agents]
+     * @param {string[]} [taskIds]
+     */
+    function _setPhase(n, mode, agents, taskIds) {
+      _state.phases.push({
+        n:       n,
+        agents:  agents  || [],
+        taskIds: taskIds || [],
+        mode:    mode
+      });
+      _state.currentPhase = n;
+    }
+
+    /**
+     * Adds an artifact entry.
+     * @param {string} path - relative path of the artifact file
+     */
+    function _addArtifact(path) {
+      if (!path) return;
+      var label = path.split("/").pop();
+      var type = "other";
+      if (/plan\.md$/.test(path))   type = "plan";
+      else if (/report\.md$/.test(path)) type = "report";
+      else if (/work\//.test(path)) type = "work";
+      _state.artifacts.push({
+        type:  type,
+        path:  path,
+        at:    new Date().toISOString(),
+        label: label
+      });
+    }
+
+    /**
+     * Updates workId and title from flow-claude end banner.
+     * @param {string} workId
+     * @param {string} title
+     */
+    function _setWorkflowEnd(workId, title) {
+      if (workId) _state.workId = workId;
+      if (title)  _state.title  = title;
+    }
+
+    /**
+     * Marks the workflow as successfully completed.
+     */
+    function _complete() {
+      _state.status      = "done";
+      _state.currentStep = "done";
+    }
+
+    /**
+     * Marks the workflow as failed.
+     * @param {string} [msg]
+     */
+    function _fail(msg) {
+      _state.status      = "failed";
+      _state.currentStep = "failed";
+      _state.error       = msg || "FAIL";
+    }
+
+    // ── Per-line pattern matching functions ──
+
+    /**
+     * Attempts to match and process a single stripped line.
+     * Returns true if the line matched any banner pattern.
+     * @param {string} line - ANSI-stripped, trimmed line
+     * @returns {boolean}
+     */
+    function _parseLine(line) {
+      var m;
+
+      // ── Box-top detection (╔═══╗) ──
+      if (P.workflowBoxTop.test(line)) {
+        _inBox    = true;
+        _boxHasCmd = false;
+        return true;
+      }
+
+      // ── End-border (════) — close any pending stepEnd or workflowEnd scan ──
+      if (P.endBorder.test(line)) {
+        _pendingStepEnd = false;
+        return true;
+      }
+
+      // ── Inside box: ▶ command → workflow start confirmed ──
+      if (_inBox && (m = P.workflowStartCmd.exec(line))) {
+        _boxHasCmd = true;
+        _inBox     = false;
+        _reset(m[1]);
+        return true;
+      }
+
+      // ── Inside box: [● ...] STEP → step start ──
+      if (_inBox && !_boxHasCmd && (m = P.stepStart.exec(line))) {
+        _inBox = false;
+        _setStep(m[1]);
+        return true;
+      }
+
+      // ── Box close line ╚═══╝ (close box state without command) ──
+      if (/╚[═]+╝/.test(line)) {
+        _inBox     = false;
+        _boxHasCmd = false;
+        return true;
+      }
+
+      // ── flow-claude end: [OK] workId · title ──
+      if ((m = P.workflowEnd.exec(line))) {
+        _setWorkflowEnd(m[1], m[2].trim());
+        return true;
+      }
+
+      // ── flow-init: INIT: title ──
+      if ((m = P.init.exec(line))) {
+        _pendingInit      = true;
+        _pendingInitTitle = m[1].trim();
+        // Clear other pending flags to avoid interference
+        _pendingStepEnd = false;
+        _pendingPhase   = false;
+        return true;
+      }
+
+      // ── flow-init: workDir line (follows INIT line) ──
+      if (_pendingInit && (m = P.initWorkDir.exec(line))) {
+        _setInit(_pendingInitTitle, m[1].trim());
+        _pendingInit      = false;
+        _pendingInitTitle = "";
+        return true;
+      }
+
+      // ── flow-step end: [● ● ○] STEP - timestamp ──
+      if ((m = P.stepEnd.exec(line))) {
+        _pendingStepEnd     = true;
+        _pendingStepEndName = m[1];
+        _pendingStepEndTs   = m[2].trim();
+        // Advance step (step end updates currentStep)
+        _setStep(m[1]);
+        return true;
+      }
+
+      // ── Artifact line (follows step end) ──
+      if ((m = P.artifactLine.exec(line))) {
+        _addArtifact(m[1].trim());
+        return true;
+      }
+
+      // ── [OK] / [ASK] result lines (follow step end) ──
+      if (_pendingStepEnd && (P.stepOk.test(line) || P.stepAsk.test(line))) {
+        _pendingStepEnd = false;
+        return true;
+      }
+
+      // ── flow-phase: STATE: Phase N mode ──
+      if ((m = P.phase.exec(line))) {
+        _pendingPhase    = true;
+        _pendingPhaseN   = parseInt(m[1], 10);
+        _pendingPhaseMode = m[2];
+        return true;
+      }
+
+      // ── flow-phase: >> agents [taskIds] ──
+      if (_pendingPhase && (m = P.phaseAgents.exec(line))) {
+        var agentsRaw = m[1].trim();
+        var taskIdsRaw = m[2] ? m[2].trim() : "";
+        var agents  = agentsRaw  ? agentsRaw.split(/[\s,]+/).filter(Boolean) : [];
+        var taskIds = taskIdsRaw ? taskIdsRaw.split(/[\s,]+/).filter(Boolean) : [];
+        _setPhase(_pendingPhaseN, _pendingPhaseMode, agents, taskIds);
+        _pendingPhase     = false;
+        _pendingPhaseN    = -1;
+        _pendingPhaseMode = "";
+        return true;
+      }
+
+      // ── flow-finish: DONE: 워크플로우 완료|실패 ──
+      if ((m = P.finishDone.exec(line))) {
+        _pendingFinish       = true;
+        _pendingFinishResult = m[1]; // "완료" or "실패"
+        return true;
+      }
+
+      // ── flow-finish: registryKey line ──
+      if (_pendingFinish && (m = P.finishKey.exec(line))) {
+        _pendingFinish = false;
+        if (_pendingFinishResult === "완료") {
+          _complete();
+        } else {
+          _fail("워크플로우 실패 (" + m[1] + ")");
+        }
+        _pendingFinishResult = "";
+        return true;
+      }
+
+      // ── FAIL bare line (early exit) ──
+      if (P.fail.test(line)) {
+        _fail("FAIL");
+        return true;
+      }
+
+      return false;
+    }
+
+    // ── Public API ──
+
+    return {
+      /**
+       * phaseTimeline state accessor (read-only reference).
+       * W03 DOM renderer reads this to build the timeline bar.
+       * @type {Object}
+       */
+      get state() { return _state; },
+
+      /**
+       * Pattern constants (exposed for testing).
+       * @type {Object}
+       */
+      patterns: P,
+
+      /**
+       * Processes raw Bash tool_use_result text.
+       * Strips ANSI codes, splits into lines, and runs each through _parseLine().
+       * Returns true if at least one banner pattern was matched.
+       * @param {string} text - raw tool_use_result stdout text
+       * @returns {boolean} true = banner(s) detected, false = no banner found
+       */
+      tap: function (text) {
+        var stripped = stripAnsi(text);
+        var lines    = stripped.split("\n");
+        var consumed = false;
+
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i].trim();
+          if (line && _parseLine(line)) {
+            consumed = true;
+          }
+        }
+
+        return consumed;
+      },
+
+      /**
+       * Resets the parser to its initial state.
+       * Call before starting a new workflow observation.
+       */
+      reset: function () {
+        _reset();
+      }
+    };
+  })();
+
+  // ── phaseTimeline DOM Renderer (W03) ──
+
+  /**
+   * phaseTimeline: DOM renderer singleton for workflow session timeline bar.
+   *
+   * Reads WorkflowRenderer.state and builds / updates the .wf-timeline-bar
+   * element fixed below the terminal-session-bar.  Also provides
+   * renderStatusBadge() for done/failed overlays and renderArtifactLinks()
+   * to refresh the artifact row.
+   *
+   * Only active when isWorkflowMode === true.
+   * All DOM mutations are guarded by `isWorkflowMode && outputDiv`.
+   */
+  var phaseTimeline = (function () {
+
+    // ── Internal helpers ──
+
+    /**
+     * Returns the .wf-timeline-bar element, creating it (and inserting it
+     * below .terminal-session-bar) if it does not yet exist.
+     * @returns {HTMLElement|null}
+     */
+    function _getOrCreateBar() {
+      var existing = document.getElementById("wf-timeline-bar");
+      if (existing) return existing;
+
+      var sessionBar = document.querySelector(".terminal-session-bar");
+      if (!sessionBar) return null;
+
+      var bar = document.createElement("div");
+      bar.className = "wf-timeline-bar";
+      bar.id = "wf-timeline-bar";
+
+      // Insert immediately after .terminal-session-bar
+      var parent = sessionBar.parentNode;
+      if (parent) {
+        parent.insertBefore(bar, sessionBar.nextSibling);
+      }
+      return bar;
+    }
+
+    /**
+     * HTML-escapes a string for safe attribute / text node insertion.
+     * @param {string} s
+     * @returns {string}
+     */
+    function _esc(s) {
+      return String(s || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    /**
+     * Builds the HTML for the .wf-steps-row based on current state.
+     * Steps: INIT → PLAN → WORK (Phase N) → REPORT → DONE
+     * @param {Object} st - WorkflowRenderer.state snapshot
+     * @returns {string} HTML fragment
+     */
+    function _buildStepsRowHtml(st) {
+      var steps = ["init", "plan", "work", "report", "done", "failed"];
+      var labels = { init: "INIT", plan: "PLAN", work: "WORK", report: "REPORT", done: "DONE", failed: "FAIL" };
+      var current = st.currentStep || "unknown";
+
+      var orderedSteps = ["init", "plan", "work", "report", "done"];
+      // If failed, append "failed" at end
+      if (current === "failed") {
+        orderedSteps.push("failed");
+      }
+
+      var stepOrder = {};
+      orderedSteps.forEach(function (s, i) { stepOrder[s] = i; });
+      var currentIdx = stepOrder[current];
+
+      var html = '<div class="wf-steps-row">';
+      orderedSteps.forEach(function (step, idx) {
+        // Determine CSS class
+        var cls = "wf-timeline-step";
+        if (step === current) {
+          cls += " active";
+        } else if (currentIdx !== undefined && idx < currentIdx) {
+          cls += " done";
+        } else {
+          cls += " pending";
+        }
+
+        html += '<div class="' + cls + '" data-step="' + _esc(step) + '">';
+        html += _esc(labels[step] || step.toUpperCase());
+
+        // Phase badge for WORK step
+        if (step === "work" && st.currentPhase >= 0) {
+          html += '<span class="wf-phase-badge">Phase ' + _esc(String(st.currentPhase)) + '</span>';
+        }
+
+        html += '</div>';
+
+        // Separator between steps (not after last)
+        if (idx < orderedSteps.length - 1) {
+          html += '<div class="wf-timeline-sep">&rarr;</div>';
+        }
+      });
+      html += '</div>';
+      return html;
+    }
+
+    /**
+     * Builds the HTML for the .wf-meta-row.
+     * @param {Object} st
+     * @returns {string}
+     */
+    function _buildMetaRowHtml(st) {
+      if (!st.command && !st.title) return "";
+      var html = '<div class="wf-meta-row">';
+      if (st.command) {
+        html += '<span class="wf-meta-command">' + _esc(st.command) + '</span>';
+        html += '<span class="wf-meta-sep">&middot;</span>';
+      }
+      if (st.title) {
+        html += '<span class="wf-meta-title">' + _esc(st.title) + '</span>';
+      }
+      if (st.workId) {
+        html += '<span class="wf-meta-id">#' + _esc(st.workId) + '</span>';
+      }
+      html += '</div>';
+      return html;
+    }
+
+    /**
+     * Builds the HTML for the .wf-artifacts-row.
+     * @param {Array} artifacts
+     * @returns {string}
+     */
+    function _buildArtifactsRowHtml(artifacts) {
+      if (!artifacts || artifacts.length === 0) return "";
+      var html = '<div class="wf-artifacts-row">';
+      artifacts.forEach(function (a) {
+        html += '<a class="wf-timeline-artifact" data-path="' + _esc(a.path) + '"'
+          + ' href="#" title="' + _esc(a.label) + ' 열기">'
+          + _esc(a.label) + '</a>';
+      });
+      html += '</div>';
+      return html;
+    }
+
+    // ── Public API ──
+
+    return {
+
+      /**
+       * Renders (or re-renders) the .wf-timeline-bar below .terminal-session-bar.
+       * Reads WorkflowRenderer.state for current step, phase, and artifacts.
+       * Guards: isWorkflowMode && outputDiv.
+       */
+      renderTimelineBar: function () {
+        if (!isWorkflowMode || !outputDiv) return;
+
+        var bar = _getOrCreateBar();
+        if (!bar) return;
+
+        var st = WorkflowRenderer.state;
+
+        var html = "";
+        html += _buildMetaRowHtml(st);
+        html += _buildStepsRowHtml(st);
+        html += _buildArtifactsRowHtml(st.artifacts);
+
+        bar.innerHTML = html;
+
+        // Bind artifact link click handlers
+        var links = bar.querySelectorAll(".wf-timeline-artifact[data-path]");
+        for (var i = 0; i < links.length; i++) {
+          (function (link) {
+            link.addEventListener("click", function (e) {
+              e.preventDefault();
+              var path = link.getAttribute("data-path");
+              if (path) {
+                phaseTimeline.openArtifact(path);
+              }
+            });
+          })(links[i]);
+        }
+      },
+
+      /**
+       * Renders or updates the .wf-artifacts-row inside the timeline bar.
+       * Called incrementally when a new artifact is added mid-session.
+       */
+      renderArtifactLinks: function () {
+        if (!isWorkflowMode || !outputDiv) return;
+
+        var bar = document.getElementById("wf-timeline-bar");
+        if (!bar) {
+          // Bar not yet created — fall back to full render
+          phaseTimeline.renderTimelineBar();
+          return;
+        }
+
+        var st = WorkflowRenderer.state;
+
+        // Update or insert artifact row
+        var existingRow = bar.querySelector(".wf-artifacts-row");
+        var newHtml = _buildArtifactsRowHtml(st.artifacts);
+
+        if (newHtml) {
+          if (existingRow) {
+            existingRow.outerHTML = newHtml;
+          } else {
+            bar.insertAdjacentHTML("beforeend", newHtml);
+          }
+          // Re-bind click handlers on the updated row
+          var links = bar.querySelectorAll(".wf-timeline-artifact[data-path]");
+          for (var i = 0; i < links.length; i++) {
+            (function (link) {
+              link.addEventListener("click", function (e) {
+                e.preventDefault();
+                var path = link.getAttribute("data-path");
+                if (path) phaseTimeline.openArtifact(path);
+              });
+            })(links[i]);
+          }
+        } else if (existingRow) {
+          existingRow.parentNode.removeChild(existingRow);
+        }
+      },
+
+      /**
+       * Renders a completion or failure status badge inside .terminal-output.
+       * The badge uses `position: sticky; bottom: 0` so it anchors to the
+       * bottom of the visible output area without covering the timeline bar.
+       *
+       * @param {"ok"|"fail"} status
+       * @param {string} [msg] - optional detail text shown in .wf-badge-sub
+       */
+      renderStatusBadge: function (status, msg) {
+        if (!isWorkflowMode || !outputDiv) return;
+
+        var follow = isNearBottom(outputDiv);
+
+        // Remove any existing badge first
+        var existing = outputDiv.querySelector(".wf-status-badge");
+        if (existing) existing.parentNode.removeChild(existing);
+
+        var st = WorkflowRenderer.state;
+        var isOk = (status === "ok");
+
+        var badge = document.createElement("div");
+        badge.className = "wf-status-badge";
+        badge.setAttribute("data-status", isOk ? "ok" : "fail");
+
+        var iconChar = isOk ? "&#10003;" : "&#10005;";
+        var labelText = isOk ? "워크플로우 완료" : "워크플로우 실패";
+        var subText = msg || (isOk
+          ? ("#" + (st.workId || "") + " · " + (st.title || ""))
+          : (st.error || "FAIL"));
+
+        badge.innerHTML =
+          '<span class="wf-badge-icon">' + iconChar + '</span>' +
+          '<span class="wf-badge-text">' + _esc(labelText) + '</span>' +
+          '<span class="wf-badge-sub">' + _esc(subText) + '</span>';
+
+        outputDiv.appendChild(badge);
+        scrollToBottomIfFollowing(outputDiv, follow);
+      },
+
+      /**
+       * Full render helper called by WorkflowRenderer.tap() integration (W04).
+       * Runs renderTimelineBar() and, if workflow ended, renderStatusBadge().
+       */
+      render: function () {
+        phaseTimeline.renderTimelineBar();
+
+        var st = WorkflowRenderer.state;
+        if (st.status === "done") {
+          phaseTimeline.renderStatusBadge("ok");
+        } else if (st.status === "failed") {
+          phaseTimeline.renderStatusBadge("fail", st.error);
+        }
+      },
+
+      /**
+       * Opens an artifact file.  Currently opens via
+       * `/api/workflow/artifact?path=<encoded>` in a new tab, falling back to
+       * a simple alert.  W05 will provide the actual server route.
+       * @param {string} path - relative artifact path
+       */
+      openArtifact: function (path) {
+        var url = "/api/workflow/artifact?path=" + encodeURIComponent(path);
+        window.open(url, "_blank");
+      },
+
+      /**
+       * Inserts the .wf-timeline-bar placeholder immediately below
+       * .terminal-session-bar at page initialization time.
+       * Called from renderTerminal() when isWorkflowMode === true.
+       */
+      insertPlaceholder: function () {
+        if (!isWorkflowMode) return;
+        _getOrCreateBar();
+      }
+
+    };
+  })();
+
+  // ── Tool Box Renderer ──
+
+  /**
+   * Creates a collapsible tool use box with <details> + <summary>.
+   * @param {string} toolName - name of the tool
+   * @returns {HTMLElement} the <details> element
+   */
+  function createToolBox(toolName) {
+    var icon = TOOL_ICONS[toolName] || DEFAULT_TOOL_ICON;
+
+    var details = document.createElement("details");
+    details.className = "term-tool-box";
+    // Store tool name for downstream dispatch lookup (insertToolResult)
+    if (toolName) {
+      details.setAttribute("data-tool-name", toolName);
+    }
+
+    var summary = document.createElement("summary");
+    summary.textContent = icon + " " + toolName;
+    details.appendChild(summary);
+
+    var resultDiv = document.createElement("div");
+    resultDiv.className = "term-tool-result";
+    details.appendChild(resultDiv);
+
+    appendToOutput(details);
+    currentToolBox = details;
+
+    return details;
+  }
+
+  /**
+   * Inserts tool result text into the current tool box.
+   * Keeps the <details> closed (user can click to expand).
+   * Routes through ToolResultRenderer.dispatch for per-tool rendering.
+   * Backward compatible: the 2-argument form (text, isError) is still supported —
+   * when toolName is omitted, dispatch falls back to fallbackPlain via its
+   * undefined-mapping branch.
+   * @param {string} text - result text
+   * @param {boolean} [isError] - whether this is an error result
+   * @param {string} [toolName] - optional tool name (falls back to currentToolBox dataset)
+   */
+  function insertToolResult(text, isError, toolName) {
+    if (!currentToolBox) return;
+    var resultDiv = currentToolBox.querySelector(".term-tool-result");
+    if (!resultDiv) return;
+
+    // Resolve tool name: explicit arg > dataset on current box
+    var resolvedToolName = toolName;
+    if (!resolvedToolName && currentToolBox.getAttribute) {
+      resolvedToolName = currentToolBox.getAttribute("data-tool-name") || undefined;
+    }
+
+    var html;
+    try {
+      html = ToolResultRenderer.dispatch(resolvedToolName, text, { isError: !!isError });
+    } catch (e) {
+      // Defensive fallback if dispatch itself throws (should not happen)
+      html = '<pre class="term-plain">' + esc(text || '') + '</pre>';
+    }
+
+    var container = document.createElement("div");
+    container.className = isError ? "term-tool-error" : "term-tool-result-rendered";
+    container.innerHTML = html;
+    resultDiv.appendChild(container);
+
+    // Keep closed
+    currentToolBox.removeAttribute("open");
+  }
+
+  // ── Thinking Spinner ──
+
+  /** @type {HTMLElement|null} thinking spinner element */
+  var thinkingEl = null;
 
   function startSpinner() {
-    if (spinnerInterval) return;
-    if (!term) return;
-    spinnerIdx = 0;
-    term.write("\r\n\x1b[33m✻ Thinking...\x1b[0m");
-    spinnerInterval = setInterval(function () {
-      if (!term) return;
-      var frame = spinnerFrames[spinnerIdx % spinnerFrames.length];
-      // 커서를 줄 맨 앞으로 → 덮어쓰기
-      term.write("\r\x1b[33m" + frame + " Thinking...\x1b[0m\x1b[K");
-      spinnerIdx++;
-    }, 80);
+    if (thinkingEl) return;
+    if (!outputDiv) return;
+
+    thinkingEl = document.createElement("div");
+    thinkingEl.className = "term-thinking";
+    thinkingEl.id = "term-thinking-active";
+    thinkingEl.innerHTML = '<span class="term-thinking-dot"></span> Thinking...';
+    appendToOutput(thinkingEl);
   }
 
   function stopSpinner() {
-    if (spinnerInterval) {
-      clearInterval(spinnerInterval);
-      spinnerInterval = null;
-      // Thinking 줄 지우기
-      if (term) {
-        term.write("\r\x1b[K");
-      }
+    if (thinkingEl && thinkingEl.parentNode) {
+      thinkingEl.parentNode.removeChild(thinkingEl);
     }
+    thinkingEl = null;
   }
 
   // ── Copy Panel ──
@@ -256,29 +1793,29 @@
     plainLog += text;
     var ta = document.getElementById("terminal-text-output");
     if (ta && textViewActive) {
+      var follow = isNearBottom(ta);
       ta.value = plainLog;
-      ta.scrollTop = ta.scrollHeight;
+      scrollToBottomIfFollowing(ta, follow);
     }
   }
 
   function toggleTextView() {
     textViewActive = !textViewActive;
-    var xtermEl = document.getElementById("terminal-output");
+    var outputEl = document.getElementById("terminal-output");
     var textEl = document.getElementById("terminal-text-output");
     var btn = document.getElementById("terminal-copy-btn");
-    if (!xtermEl || !textEl) return;
+    if (!outputEl || !textEl) return;
 
     if (textViewActive) {
-      xtermEl.style.display = "none";
+      outputEl.style.display = "none";
       textEl.style.display = "block";
       textEl.value = plainLog;
       textEl.scrollTop = textEl.scrollHeight;
       if (btn) btn.textContent = "Terminal";
     } else {
-      xtermEl.style.display = "";
+      outputEl.style.display = "";
       textEl.style.display = "none";
       if (btn) btn.textContent = "Text";
-      if (fitAddon) { try { fitAddon.fit(); } catch (e) {} }
     }
   }
 
@@ -316,7 +1853,7 @@
    * @returns {Promise<void>}
    */
   function fetchStatus() {
-    return fetch("/terminal/status", { cache: "no-store" }).then(function (res) {
+    return fetch(endpoints().status, { cache: "no-store" }).then(function (res) {
       if (!res.ok) return;
       return res.json();
     }).then(function (data) {
@@ -337,121 +1874,12 @@
         var modeEl = document.getElementById("terminal-sl-mode");
         if (modeEl) modeEl.textContent = data.permission_mode;
       }
+      if (data.branch) {
+        var branchEl = document.getElementById("terminal-sl-branch");
+        if (branchEl) branchEl.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:3px"><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M6 15V9a6 6 0 0 0 6-6h0a6 6 0 0 0 6 6"/></svg>' + data.branch;
+      }
       updateControlBar();
     }).catch(function () {});
-  }
-
-  // ── xterm.js Management ──
-
-  /**
-   * Initializes the xterm.js terminal instance and attaches it to the DOM.
-   * Waits for the CDN-loaded Terminal constructor if not yet available.
-   * On re-render, disposes the old instance and creates a fresh one to avoid
-   * stale DOM references from innerHTML replacement.
-   * @param {HTMLElement} container - DOM element to attach the terminal to
-   * @param {function} [callback] - called after terminal is ready
-   */
-  function initXterm(container, callback) {
-    // Dispose previous instance since the container DOM was replaced by innerHTML
-    if (term) {
-      term.dispose();
-      term = null;
-    }
-
-    function create() {
-      term = new Terminal({
-        convertEol: true,
-        fontSize: 14,
-        fontFamily: "'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Consolas', monospace",
-        theme: {
-          background: "#1e1e1e",
-          foreground: "#cccccc",
-          cursor: "#569cd6",
-          selectionBackground: "rgba(86,156,214,0.3)",
-          black: "#1e1e1e",
-          red: "#f44747",
-          green: "#4ec9b0",
-          yellow: "#dcdcaa",
-          blue: "#569cd6",
-          magenta: "#c586c0",
-          cyan: "#9cdcfe",
-          white: "#cccccc",
-          brightBlack: "#858585",
-          brightRed: "#f44747",
-          brightGreen: "#4ec9b0",
-          brightYellow: "#dcdcaa",
-          brightBlue: "#569cd6",
-          brightMagenta: "#c586c0",
-          brightCyan: "#9cdcfe",
-          brightWhite: "#ffffff",
-        },
-        cursorBlink: false,
-        disableStdin: true,
-        scrollback: 10000,
-      });
-      term.open(container);
-
-      // Fit addon: resize terminal columns to match container width
-      if (typeof FitAddon !== "undefined" && FitAddon.FitAddon) {
-        fitAddon = new FitAddon.FitAddon();
-        term.loadAddon(fitAddon);
-        fitAddon.fit();
-        window.addEventListener("resize", function () {
-          if (fitAddon) { try { fitAddon.fit(); } catch (e) {} }
-        });
-      }
-
-      // Auto-copy selection to clipboard
-      term.onSelectionChange(function () {
-        var sel = term.getSelection();
-        if (sel && navigator.clipboard) {
-          navigator.clipboard.writeText(sel).catch(function () {});
-        }
-      });
-
-      // Keyboard shortcuts (document-level, skip when input focused)
-      document.addEventListener("keydown", function (e) {
-        if (!term) return;
-        if (document.activeElement && document.activeElement.tagName === "TEXTAREA") return;
-        // F2 or Ctrl+Shift+C: toggle text view
-        if (e.key === "F2" || (e.ctrlKey && e.shiftKey && (e.key === "C" || e.key === "c"))) {
-          e.preventDefault();
-          toggleTextView();
-        }
-      });
-
-      term.writeln("\x1b[90mClaude Code Terminal\x1b[0m");
-      term.writeln("\x1b[90mPress \"Start\" to begin a session.\x1b[0m");
-      if (callback) callback();
-    }
-
-    // Wait for CDN-loaded Terminal constructor
-    if (typeof Terminal !== "undefined") {
-      create();
-    } else {
-      var elapsed = 0;
-      var checkInterval = setInterval(function () {
-        elapsed += XTERM_CDN_CHECK_INTERVAL;
-        if (typeof Terminal !== "undefined") {
-          clearInterval(checkInterval);
-          create();
-        } else if (elapsed >= XTERM_CDN_MAX_WAIT) {
-          clearInterval(checkInterval);
-          container.innerHTML = '<div class="empty" style="margin-top:32px;color:#f44747">'
-            + 'Failed to load xterm.js from CDN. Check your network connection.</div>';
-        }
-      }, XTERM_CDN_CHECK_INTERVAL);
-    }
-  }
-
-  /**
-   * Disposes the xterm.js terminal instance and cleans up resources.
-   */
-  function disposeXterm() {
-    if (term) {
-      term.dispose();
-      term = null;
-    }
   }
 
   // ── SSE Connection ──
@@ -472,18 +1900,12 @@
         return;
       }
 
-      // connectSSE() 내부에서 open 이벤트 리스너가 등록되므로,
-      // 여기서는 open 이벤트를 한 번만 감지하는 일회성 리스너를 사전 등록한다
       var timer = setTimeout(function () {
         reject(new Error("SSE connection timeout"));
       }, 5000);
 
-      // connectSSE()를 호출하기 전에 임시 EventSource를 열어 open을 감지한다
-      // connectSSE()가 내부적으로 disconnectSSE()를 호출하여 기존 연결을 교체하므로
-      // 새로운 EventSource 참조를 가져와야 한다
       connectSSE();
 
-      // connectSSE() 완료 후 생성된 termEventSource에 open 리스너 추가
       var source = termEventSource;
       if (!source) {
         clearTimeout(timer);
@@ -518,11 +1940,12 @@
   /**
    * Connects to the terminal SSE event stream.
    * Handles stdout, result, system, and permission events.
+   * All output is rendered as HTML div elements (no xterm.js dependency).
    */
   function connectSSE() {
     disconnectSSE();
 
-    termEventSource = new EventSource("/terminal/events");
+    termEventSource = new EventSource(endpoints().events);
 
     termEventSource.addEventListener("open", function () {
       Board.state.termConnected = true;
@@ -532,46 +1955,61 @@
     termEventSource.addEventListener("stdout", function (e) {
       try {
         var data = JSON.parse(e.data);
-        if (term) {
-          if (data.chunk && data.kind === "text_delta") {
-            receivedChunks = true;
-            textBuffer += data.chunk;
-          } else if (data.text && data.kind === "assistant" && !receivedChunks) {
-            textBuffer += data.text;
-          } else if (data.kind === "content_block_start" && data.raw) {
-            var block = data.raw.content_block || {};
-            if (block.type === "tool_use" && block.name) {
-              var icon = TOOL_ICONS[block.name] || DEFAULT_TOOL_ICON;
-              term.writeln("");
-              term.writeln("\x1b[33m" + icon + " " + block.name + "\x1b[0m");
-              appendPlainLog("\n" + icon + " " + block.name + "\n");
-            }
-          } else if (data.kind === "user" && data.raw) {
-            var tr = data.raw.tool_use_result;
-            var mc = data.raw.message && data.raw.message.content;
-            var resultText = "";
 
-            if (tr) {
-              if (tr.stdout) resultText = tr.stdout;
-              else if (tr.file && tr.file.content) resultText = tr.file.content;
-              else if (typeof tr.content === "string") resultText = tr.content;
-            }
-            if (!resultText && mc && mc[0] && typeof mc[0].content === "string") {
-              resultText = mc[0].content;
-            }
+        if (data.chunk && data.kind === "text_delta") {
+          receivedChunks = true;
+          textBuffer += data.chunk;
+        } else if (data.text && data.kind === "assistant" && !receivedChunks) {
+          textBuffer += data.text;
+        } else if (data.kind === "content_block_start" && data.raw) {
+          var block = data.raw.content_block || {};
+          if (block.type === "tool_use" && block.name) {
+            createToolBox(block.name);
+            appendPlainLog("\n" + (TOOL_ICONS[block.name] || DEFAULT_TOOL_ICON) + " " + block.name + "\n");
+          }
+        } else if (data.kind === "user" && data.raw) {
+          var tr = data.raw.tool_use_result;
+          var mc = data.raw.message && data.raw.message.content;
+          var resultText = "";
 
-            if (resultText) {
-              term.writeln("\x1b[90m" + resultText + "\x1b[0m");
-              appendPlainLog(resultText + "\n");
+          if (tr) {
+            if (tr.stdout) resultText = tr.stdout;
+            else if (tr.file && tr.file.content) resultText = tr.file.content;
+            else if (typeof tr.content === "string") resultText = tr.content;
+          }
+          if (!resultText && mc && mc[0] && typeof mc[0].content === "string") {
+            resultText = mc[0].content;
+          }
+
+          if (resultText) {
+            // W04: WorkflowRenderer tap integration
+            // In workflow mode, try to parse banner patterns first.
+            // If tap() returns true (banner detected), render the timeline and
+            // skip the normal insertToolResult() path to avoid double-rendering.
+            var bannerConsumed = false;
+            if (isWorkflowMode) {
+              try {
+                bannerConsumed = WorkflowRenderer.tap(resultText);
+                if (bannerConsumed) {
+                  phaseTimeline.render();
+                }
+              } catch (tapErr) {
+                // Fallback: if tap/render throws, proceed with normal rendering
+                bannerConsumed = false;
+              }
             }
-            if (tr && tr.stderr) {
-              term.writeln("\x1b[31m" + tr.stderr + "\x1b[0m");
-              appendPlainLog("[stderr] " + tr.stderr + "\n");
+            if (!bannerConsumed) {
+              insertToolResult(resultText, false);
             }
-            if (mc && mc[0] && mc[0].is_error) {
-              term.writeln("\x1b[31m[Tool Error]\x1b[0m");
-              appendPlainLog("[Tool Error]\n");
-            }
+            appendPlainLog(resultText + "\n");
+          }
+          if (tr && tr.stderr) {
+            insertToolResult("[stderr] " + tr.stderr, true);
+            appendPlainLog("[stderr] " + tr.stderr + "\n");
+          }
+          if (mc && mc[0] && mc[0].is_error) {
+            insertToolResult("[Tool Error]", true);
+            appendPlainLog("[Tool Error]\n");
           }
         }
       } catch (err) {
@@ -584,19 +2022,21 @@
         var data = JSON.parse(e.data);
         if (data.done) {
           stopSpinner();
-          if (data.cost_usd) sessionCost += data.cost_usd;
-          if (data.input_tokens) sessionTokens.input += data.input_tokens;
-          if (data.output_tokens) sessionTokens.output += data.output_tokens;
-          if (term && textBuffer) {
-            term.writeln("");
-            term.write(renderMarkdown(textBuffer));
-            term.writeln("");
+          // cost_usd: 세션 누적값 (assign) / tokens: 해당 턴 값 (assign)
+          if (typeof data.cost_usd === "number") sessionCost = data.cost_usd;
+          if (typeof data.input_tokens === "number") sessionTokens.input = data.input_tokens;
+          if (typeof data.output_tokens === "number") sessionTokens.output = data.output_tokens;
+
+          if (textBuffer) {
+            var html = renderMarkdownToHtml(textBuffer);
+            appendHtmlBlock(html, "term-message term-assistant");
             appendPlainLog("\n" + textBuffer + "\n");
           }
           textBuffer = "";
-          if (term) {
-            term.writeln("\x1b[90mResponse complete\x1b[0m");
-          }
+          currentToolBox = null;
+
+          appendSystemMessage("Response complete");
+
           Board.state.termStatus = "idle";
           receivedChunks = false;
           setInputLocked(false);
@@ -613,20 +2053,16 @@
         if (data.subtype === "init" && data.session_id) {
           Board.state.termSessionId = data.session_id;
           Board.state.termStatus = "idle";
-          sessionCost = 0;
-          sessionTokens = { input: 0, output: 0 };
+          // NOTE: 토큰/비용 리셋은 process_exit에서만 수행 (init은 세션 재연결 시에도 fire됨)
           // Extract model and context window from raw init data
           if (data.raw && data.raw.model) {
             var rawModel = data.raw.model;
-            // "claude-opus-4-6[1m]" → "Opus 4.6", contextWindow=1000000
             var ctxMatch = rawModel.match(/\[(\d+)([mk])\]/i);
             if (ctxMatch) {
               var ctxNum = parseInt(ctxMatch[1]);
               contextWindow = ctxMatch[2].toLowerCase() === "m" ? ctxNum * 1000000 : ctxNum * 1000;
             }
-            // Pretty model name
             var clean = rawModel.replace(/\[.*\]/, "").replace(/^claude-/, "");
-            // "opus-4-6" → "Opus 4.6"
             clean = clean.replace(/-(\d+)-(\d+)/, " $1.$2").replace(/-/g, " ");
             clean = clean.charAt(0).toUpperCase() + clean.slice(1);
             sessionModel = clean;
@@ -636,21 +2072,23 @@
             var modeEl = document.getElementById("terminal-sl-mode");
             if (modeEl) modeEl.textContent = data.raw.permissionMode;
           }
-          if (term) {
-            term.writeln("\x1b[32mSession started\x1b[0m");
-          }
+          appendSystemMessage("Session started");
           setInputLocked(false);
           updateControlBar();
         } else if (data.subtype === "process_exit") {
+          // spawn()이 이전 프로세스를 kill한 뒤 새 프로세스를 시작하면
+          // 이전 프로세스의 process_exit이 도착한다. startSession()이
+          // 이미 termStatus를 "running"으로 설정한 상태이므로 무시한다.
+          if (Board.state.termStatus === "running") return;
           Board.state.termStatus = "stopped";
           Board.state.termSessionId = null;
+          // 세션 종료 시 누적 토큰/비용 리셋
+          sessionCost = 0;
+          sessionTokens = { input: 0, output: 0 };
           stopSpinner();
-          // 143=SIGTERM (Kill 버튼), 0=정상종료 → 무시
           var exitCode = data.exit_code;
           if (exitCode !== 0 && exitCode !== 143 && exitCode !== undefined) {
-            if (term) {
-              term.writeln("\x1b[31mProcess exited with code " + exitCode + "\x1b[0m");
-            }
+            appendErrorMessage("Process exited with code " + exitCode);
           }
           setInputLocked(false);
           updateControlBar();
@@ -663,10 +2101,10 @@
     termEventSource.addEventListener("permission", function (e) {
       try {
         var data = JSON.parse(e.data);
-        if (term) {
-          term.writeln("");
-          term.writeln("\x1b[33m[Permission Request]\x1b[0m " + esc(data.description || "Tool use requested"));
-        }
+        var div = document.createElement("div");
+        div.className = "term-system term-permission";
+        div.innerHTML = '<span class="term-permission-label">[Permission Request]</span> ' + esc(data.description || "Tool use requested");
+        appendToOutput(div);
       } catch (err) {
         // Ignore parse errors
       }
@@ -675,12 +2113,10 @@
     termEventSource.addEventListener("error", function (e) {
       try {
         var data = JSON.parse(e.data);
-        // Kill(143) / 정상종료(0) 에러 무시
+        // Kill(143) / normal exit(0) — ignore
         if (data.exit_code === 143 || data.exit_code === 0) return;
         stopSpinner();
-        if (term) {
-          term.writeln("\x1b[31m[Error] " + esc(data.message || "Process error") + "\x1b[0m");
-        }
+        appendErrorMessage("[Error] " + (data.message || "Process error"));
         Board.state.termStatus = "stopped";
         Board.state.termSessionId = null;
         setInputLocked(false);
@@ -744,6 +2180,7 @@
 
   /**
    * Sends user input text to the terminal server.
+   * Displays input as a user message in the output div.
    */
   function sendInput() {
     var input = document.getElementById("terminal-input");
@@ -752,10 +2189,11 @@
     if (!text) return;
     if (inputLocked || Board.state.termStatus === "stopped") return;
 
-    if (term) {
-      term.writeln("");
-      term.writeln("\x1b[36m> " + text + "\x1b[0m");
-    }
+    // Display user input as HTML message
+    var div = document.createElement("div");
+    div.className = "term-message term-user";
+    div.textContent = text;
+    appendToOutput(div);
     appendPlainLog("\n> " + text + "\n");
 
     setInputLocked(true);
@@ -765,11 +2203,10 @@
     input.value = "";
     input.style.height = "auto";
 
-    postJson("/terminal/input", { text: text }).catch(function (err) {
+    var ep = endpoints();
+    postJson(ep.input, ep.inputBody({ text: text })).catch(function (err) {
       stopSpinner();
-      if (term) {
-        term.writeln("\x1b[31m[Error] " + esc(err.message) + "\x1b[0m");
-      }
+      appendErrorMessage("[Error] " + err.message);
       setInputLocked(false);
       Board.state.termStatus = "idle";
       updateControlBar();
@@ -784,18 +2221,26 @@
    * the system/init event is never missed.
    */
   function startSession() {
-    if (Board.state.termStatus === "running") return;
-
-    if (term) {
-      term.clear();
-      term.writeln("\x1b[90mStarting session...\x1b[0m");
+    // updateControlBar()의 startBtn.disabled 조건(termStatus !== "stopped")과 동일한 의도:
+    // stopped 상태일 때만 세션 시작을 허용하여 idle 상태에서의 중복 실행을 차단한다.
+    if (Board.state.termStatus !== "stopped") return;
+    if (isWorkflowMode) {
+      // Workflow sessions are started by flow-launcher, not by the UI.
+      // Just connect SSE to the already-running session.
+      clearOutput();
+      appendSystemMessage("Connecting to workflow session " + workflowSessionId + "...");
+      connectSSEReady().catch(function (err) {
+        appendErrorMessage("[Error] SSE connect failed: " + err.message);
+      });
+      return;
     }
+
+    clearOutput();
+    appendSystemMessage("Starting session...");
 
     Board.state.termStatus = "running";
     updateControlBar();
 
-    // SSE 연결이 준비된 후에만 /terminal/start를 호출한다.
-    // connectSSEReady()는 이미 연결되어 있으면 즉시 resolve한다.
     connectSSEReady().then(function () {
       return postJson("/terminal/start");
     }).then(function (data) {
@@ -804,14 +2249,11 @@
         Board.state.termStatus = "idle";
         updateControlBar();
       }
-      // init 대기 없이 바로 전송 — stdin 버퍼에 쌓임
       startSpinner();
       setInputLocked(true);
       postJson("/terminal/input", { text: "첫 메시지입니다. '세션이 초기화 되었습니다.' 라고만 답하세요." }).catch(function () {});
     }).catch(function (err) {
-      if (term) {
-        term.writeln("\x1b[31m[Error] Failed to start session: " + esc(err.message) + "\x1b[0m");
-      }
+      appendErrorMessage("[Error] Failed to start session: " + err.message);
       Board.state.termStatus = "stopped";
       updateControlBar();
     });
@@ -823,19 +2265,28 @@
   function killSession() {
     if (Board.state.termStatus === "stopped") return;
 
-    postJson("/terminal/kill").then(function () {
-      if (term) {
-        term.writeln("\x1b[33mSession terminated\x1b[0m");
-      }
+    var epK = endpoints();
+    postJson(epK.kill, epK.inputBody({})).then(function () {
+      appendSystemMessage("Session terminated");
       Board.state.termStatus = "stopped";
       Board.state.termSessionId = null;
       setInputLocked(false);
       updateControlBar();
     }).catch(function (err) {
-      if (term) {
-        term.writeln("\x1b[31m[Error] Failed to kill session: " + esc(err.message) + "\x1b[0m");
-      }
+      appendErrorMessage("[Error] Failed to kill session: " + err.message);
     });
+  }
+
+  // ── Output Clear ──
+
+  /**
+   * Clears the output div contents.
+   */
+  function clearOutput() {
+    if (outputDiv) {
+      outputDiv.innerHTML = "";
+    }
+    plainLog = "";
   }
 
   // ── UI Update ──
@@ -850,7 +2301,12 @@
     var statusDot = document.getElementById("terminal-status-dot");
     var statusText = document.getElementById("terminal-status-text");
     if (startBtn) {
-      startBtn.disabled = Board.state.termStatus === "running";
+      if (isWorkflowMode) {
+        startBtn.style.display = "none";
+      } else {
+        // 세션이 이미 존재하면(idle/running) Start 비활성화 — stopped일 때만 활성
+        startBtn.disabled = Board.state.termStatus !== "stopped";
+      }
     }
     if (killBtn) {
       killBtn.disabled = Board.state.termStatus === "stopped";
@@ -879,11 +2335,26 @@
 
   function updateStatusLine() {
     var slModel = document.getElementById("terminal-sl-model");
-    var slBar = document.getElementById("terminal-sl-bar");
     var slTokens = document.getElementById("terminal-sl-tokens");
     var slCost = document.getElementById("terminal-sl-cost");
 
     if (slModel) slModel.textContent = sessionModel;
+
+    // Branch: add git branch SVG icon prefix if element has content
+    var slBranch = document.getElementById("terminal-sl-branch");
+    if (slBranch) {
+      var branchText = slBranch.textContent.replace(/^\ue0a0\s*/, "").trim();
+      if (!branchText || branchText === "--") branchText = slBranch.textContent.trim();
+      // Strip any previous icon (SVG or text)
+      var existingSvg = slBranch.querySelector("svg");
+      if (existingSvg) {
+        branchText = slBranch.textContent.trim();
+        existingSvg.remove();
+      }
+      if (branchText && branchText !== "--") {
+        slBranch.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:3px"><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M6 15V9a6 6 0 0 0 6-6h0a6 6 0 0 0 6 6"/></svg>' + branchText;
+      }
+    }
 
     // Context progress bar
     var totalTokens = sessionTokens.input + sessionTokens.output;
@@ -921,10 +2392,11 @@
 
   /**
    * Main Terminal tab render entry point.
-   * On first call, builds the full terminal UI layout, initializes xterm.js
-   * and SSE connection. On subsequent calls (tab re-activation), only updates
-   * the control bar state without destroying/rebuilding the DOM, so that
-   * xterm.js output history is preserved across tab switches.
+   * On first call, builds the full terminal UI layout, initializes the HTML
+   * div output container and SSE connection. On subsequent calls (tab
+   * re-activation), only updates the control bar state without
+   * destroying/rebuilding the DOM, so that output history is preserved
+   * across tab switches.
    *
    * Supports dual mode:
    *  - SPA mode (index.html): renders into #view-terminal
@@ -937,10 +2409,6 @@
     // If already initialized and the DOM container still exists, just refresh state
     if (termInitialized && document.getElementById("terminal-output")) {
       updateControlBar();
-      // Re-fit xterm if the container was hidden and is now visible
-      if (term) {
-        try { term.refresh(0, term.rows - 1); } catch (e) { /* ignore */ }
-      }
       return;
     }
 
@@ -965,6 +2433,12 @@
     h += '<button class="terminal-btn terminal-btn-kill" id="terminal-kill-btn">Kill</button>';
     h += '<button class="terminal-btn terminal-btn-copy" id="terminal-copy-btn" title="Toggle text view (F2)">Text</button>';
     h += '<span class="terminal-controls-divider"></span>';
+    h += '<button class="terminal-btn terminal-btn-sessions" id="terminal-sessions-btn" title="Workflow sessions">';
+    h += '<span id="terminal-sessions-label">Sessions</span>';
+    h += '<span class="terminal-sessions-count" id="terminal-sessions-count" style="display:none"></span>';
+    h += '</button>';
+    h += '<div class="terminal-sessions-dropdown" id="terminal-sessions-dropdown"></div>';
+    h += '<span class="terminal-controls-divider"></span>';
     h += '<button class="terminal-btn terminal-btn-settings" id="terminal-settings-btn" title="Settings">';
     h += '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">';
     h += '<circle cx="12" cy="12" r="3"/>';
@@ -978,7 +2452,7 @@
     h += '</div>';
     h += '</div>';
 
-    // xterm.js output area
+    // HTML div output area
     h += '<div class="terminal-output" id="terminal-output"></div>';
     h += '<textarea class="terminal-text-output" id="terminal-text-output" readonly spellcheck="false" style="display:none"></textarea>';
 
@@ -1003,7 +2477,7 @@
     // Status line
     h += '<div class="terminal-statusline" id="terminal-statusline">';
     h += '<span class="terminal-sl-model" id="terminal-sl-model">--</span>';
-    h += '<span class="terminal-sl-branch" id="terminal-sl-branch"></span>';
+    h += '<span class="terminal-sl-branch" id="terminal-sl-branch">--</span>';
     h += '<span class="terminal-sl-bar" id="terminal-sl-bar"><span class="terminal-sl-bar-track"><span class="terminal-sl-bar-fill" id="terminal-sl-bar-fill" style="width:0%"></span></span><span id="terminal-sl-bar-pct">0%</span></span>';
     h += '<span class="terminal-sl-tokens" id="terminal-sl-tokens">(0/0)</span>';
     h += '<span class="terminal-sl-right">';
@@ -1017,18 +2491,20 @@
 
     el.innerHTML = h;
 
-    // Initialize xterm.js in the output area
-    var outputEl = document.getElementById("terminal-output");
-    if (outputEl) {
-      initXterm(outputEl, function () {
-        // After xterm init, connect SSE if not already connected
-        if (!termEventSource) {
-          connectSSE();
-        }
-        // Fetch initial status
-        fetchStatus();
-      });
+    // Initialize HTML div output container
+    initOutputDiv();
+
+    // Workflow mode: insert timeline bar placeholder below session-bar
+    if (isWorkflowMode) {
+      phaseTimeline.insertPlaceholder();
     }
+
+    // Connect SSE if not already connected
+    if (!termEventSource) {
+      connectSSE();
+    }
+    // Fetch initial status
+    fetchStatus();
 
     // Bind event handlers
     var startBtn = document.getElementById("terminal-start-btn");
@@ -1063,10 +2539,8 @@
       restartBtn.addEventListener("click", function () {
         settingsDropdown.classList.remove("visible");
         postJson("/api/restart").then(function () {
-          // Server will restart via execv — reload page after short delay
           setTimeout(function () { location.reload(); }, 1500);
         }).catch(function () {
-          // Server may already be restarting
           setTimeout(function () { location.reload(); }, 2000);
         });
       });
@@ -1075,7 +2549,7 @@
     if (clearBtn) {
       clearBtn.addEventListener("click", function () {
         settingsDropdown.classList.remove("visible");
-        if (term) { term.clear(); }
+        clearOutput();
       });
     }
     var copyBtn = document.getElementById("terminal-copy-btn");
@@ -1089,7 +2563,6 @@
           sendInput();
           return;
         }
-        // Enter 외 모든 키는 textarea 네이티브 동작 보장 (xterm 가로채기 방지)
         e.stopPropagation();
       });
       // Auto-resize textarea
@@ -1099,21 +2572,158 @@
       });
     }
 
-    // ResizeObserver for fit addon
-    var outputEl2 = document.getElementById("terminal-output");
-    if (outputEl2 && typeof ResizeObserver !== "undefined") {
-      new ResizeObserver(function () {
-        if (fitAddon) { try { fitAddon.fit(); } catch (e) {} }
-      }).observe(outputEl2);
-    }
+    // Keyboard shortcuts (document-level, skip when input focused)
+    document.addEventListener("keydown", function (e) {
+      if (document.activeElement && document.activeElement.tagName === "TEXTAREA") return;
+      // F2 or Ctrl+Shift+C: toggle text view
+      if (e.key === "F2" || (e.ctrlKey && e.shiftKey && (e.key === "C" || e.key === "c"))) {
+        e.preventDefault();
+        toggleTextView();
+      }
+    });
 
     termInitialized = true;
+
+    // Workflow sessions dropdown — wire up
+    var sessionsBtn = document.getElementById("terminal-sessions-btn");
+    var sessionsDropdown = document.getElementById("terminal-sessions-dropdown");
+    if (sessionsBtn && sessionsDropdown) {
+      sessionsBtn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        sessionsDropdown.classList.toggle("visible");
+      });
+      document.addEventListener("click", function () {
+        sessionsDropdown.classList.remove("visible");
+      });
+    }
+    refreshWorkflowSessions();
+    setInterval(refreshWorkflowSessions, 5000);
 
     // Fetch branch on load
     fetch("/api/branch").then(function (r) { return r.json(); }).then(function (d) {
       if (d.branch) {
         var el = document.getElementById("terminal-sl-branch");
-        if (el) el.textContent = d.branch;
+        if (el) el.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:3px"><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M6 15V9a6 6 0 0 0 6-6h0a6 6 0 0 0 6 6"/></svg>' + d.branch;
+      }
+    }).catch(function () {});
+  }
+
+  // ── Workflow sessions list ──
+
+  /**
+   * Fetches the active workflow sessions and updates the dropdown + count.
+   */
+  /**
+   * Purges a stopped workflow session (removes metadata + disk file).
+   */
+  function purgeSession(sid) {
+    return fetch("/terminal/workflow/kill", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sid, purge: true }),
+    }).then(function () { refreshWorkflowSessions(); });
+  }
+
+  /**
+   * Purges all stopped sessions in the current list.
+   */
+  function purgeAllStopped() {
+    fetch("/terminal/workflow/list", { cache: "no-store" }).then(function (r) {
+      return r.json();
+    }).then(function (sessions) {
+      var stopped = (sessions || []).filter(function (s) { return s.status === "stopped"; });
+      return Promise.all(stopped.map(function (s) { return purgeSession(s.session_id); }));
+    }).catch(function () {});
+  }
+
+  function refreshWorkflowSessions() {
+    fetch("/terminal/workflow/list", { cache: "no-store" }).then(function (r) {
+      return r.json();
+    }).then(function (sessions) {
+      sessions = Array.isArray(sessions) ? sessions : [];
+
+      // 그룹 분리: running / stopped
+      var running = sessions.filter(function (s) { return s.status === "running"; });
+      var stopped = sessions.filter(function (s) { return s.status !== "running"; });
+
+      // 정렬: created_at 역순 (최신이 위)
+      var byDateDesc = function (a, b) { return (b.created_at || "").localeCompare(a.created_at || ""); };
+      running.sort(byDateDesc);
+      stopped.sort(byDateDesc);
+
+      // 카운트 배지: 실행 중만 강조
+      var countEl = document.getElementById("terminal-sessions-count");
+      var dropdown = document.getElementById("terminal-sessions-dropdown");
+      if (countEl) {
+        if (running.length > 0) {
+          countEl.textContent = running.length;
+          countEl.style.display = "";
+        } else {
+          countEl.style.display = "none";
+        }
+      }
+      if (!dropdown) return;
+
+      // 세션 1개를 HTML row로 렌더
+      var renderRow = function (s) {
+        if (s.session_id === workflowSessionId) return "";
+        var url = "terminal.html?session=" + encodeURIComponent(s.session_id);
+        var time = (s.created_at || "").slice(11, 16); // HH:MM 부분만
+        var html = '';
+        html += '<div class="terminal-sessions-row" data-status="' + (s.status || "") + '">';
+        html += '<a class="terminal-sessions-item" href="' + url + '">';
+        html += '<span class="terminal-sessions-item-ticket">' + (s.ticket_id || "") + '</span>';
+        html += '<span class="terminal-sessions-item-label">' + (s.command || "") + '</span>';
+        html += '<span class="terminal-sessions-item-time">' + time + '</span>';
+        html += '<span class="terminal-sessions-item-status" data-status="' + (s.status || "") + '">' + (s.status || "") + '</span>';
+        html += '</a>';
+        if (s.status !== "running") {
+          html += '<button class="terminal-sessions-purge" data-sid="' + s.session_id + '" title="Remove">×</button>';
+        }
+        html += '</div>';
+        return html;
+      };
+
+      var h = "";
+      // "Main" link (워크플로우 모드일 때만)
+      if (isWorkflowMode) {
+        h += '<a class="terminal-sessions-item terminal-sessions-main" href="terminal.html">';
+        h += '<span class="terminal-sessions-item-label">↩ Main session</span>';
+        h += '</a>';
+        h += '<div class="terminal-sessions-divider"></div>';
+      }
+
+      if (running.length > 0) {
+        h += '<div class="terminal-sessions-header">Running (' + running.length + ')</div>';
+        running.forEach(function (s) { h += renderRow(s); });
+      }
+      if (stopped.length > 0) {
+        if (running.length > 0) h += '<div class="terminal-sessions-divider"></div>';
+        h += '<div class="terminal-sessions-header">Stopped (' + stopped.length + ') <button class="terminal-sessions-clear-all" id="terminal-sessions-clear-all">Clear all</button></div>';
+        stopped.forEach(function (s) { h += renderRow(s); });
+      }
+      if (running.length === 0 && stopped.length === 0 && !isWorkflowMode) {
+        h += '<div class="terminal-sessions-empty">No workflow sessions</div>';
+      }
+      dropdown.innerHTML = h;
+
+      // Wire purge buttons
+      dropdown.querySelectorAll(".terminal-sessions-purge").forEach(function (btn) {
+        btn.addEventListener("click", function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+          purgeSession(btn.getAttribute("data-sid"));
+        });
+      });
+      var clearAll = document.getElementById("terminal-sessions-clear-all");
+      if (clearAll) {
+        clearAll.addEventListener("click", function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+          if (confirm("Remove all " + stopped.length + " stopped session(s)?")) {
+            purgeAllStopped();
+          }
+        });
       }
     }).catch(function () {});
   }
@@ -1126,15 +2736,13 @@
    */
   function cleanupTerminal() {
     disconnectSSE();
-    disposeXterm();
+    outputDiv = null;
+    currentToolBox = null;
+    thinkingEl = null;
     termInitialized = false;
   }
 
   // ── Hook into switchTab (SPA mode only) ──
-  // Extend switchTab to trigger renderTerminal when Terminal tab is selected.
-  // In standalone mode (terminal.html), Board.util.switchTab is defined by common.js
-  // but there are no tab buttons — the hook is still safe since querySelectorAll
-  // returns an empty NodeList and switchTab is never called externally.
   if (Board.util.switchTab) {
     var originalSwitchTab = Board.util.switchTab;
     Board.util.switchTab = function (target, skipPush) {
@@ -1145,8 +2753,7 @@
     };
   }
 
-  // Also re-bind existing tab click listeners (since common.js binds them before this override)
-  // querySelectorAll returns empty NodeList in standalone mode — forEach is a no-op.
+  // Also re-bind existing tab click listeners
   document.querySelectorAll(".tab").forEach(function (t) {
     t.addEventListener("click", function () {
       if (t.dataset.view === "terminal" && Board.render.renderTerminal) {

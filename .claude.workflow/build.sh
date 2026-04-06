@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 # build.sh — Claude Code 워크플로우 환경 자동 초기화 스크립트
-# 지원: Ubuntu 20.04+, macOS 13.0+ | 의존성: git, curl, python3, tmux, gh
+# 지원: Ubuntu 20.04+, macOS 13.0+ | 의존성: git, curl, python3, gh | 선택: tmux
 
 # --- 상수 로드 ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -128,15 +128,18 @@ _register_gh_apt_repo() {
     && sudo apt-get update -qq
 }
 
-# --- python3 및 tmux 자동 설치 ---
+# --- python3 자동 설치 (tmux는 선택 사항) ---
 install_dependencies() {
-    print_step "2" "의존성 설치 확인 (python3, tmux, gh)"
+    print_step "2" "의존성 설치 확인 (python3, gh)"
     local missing_deps=()
     if ! command -v python3 &>/dev/null; then missing_deps+=("python3"); else check_python_version; fi
-    command -v tmux &>/dev/null || missing_deps+=("tmux")
     command -v gh   &>/dev/null || missing_deps+=("gh")
+    # tmux는 선택 사항 — TMUX_PANE 폴백 경로에서만 사용되므로 필수가 아님
+    if ! command -v tmux &>/dev/null; then
+        print_warning "tmux가 설치되어 있지 않습니다 (선택 사항). tmux 폴백 경로가 비활성화됩니다."
+    fi
     if [ "${#missing_deps[@]}" -eq 0 ]; then
-        print_success "의존성 이미 설치됨 (python3, tmux, gh)"; return 0
+        print_success "의존성 이미 설치됨 (python3, gh)"; return 0
     fi
     print_info "미설치 의존성: ${missing_deps[*]}"
     case "${DETECTED_OS:-linux}" in
@@ -204,8 +207,8 @@ _merge_aliases() {
     # 기존 파일에서 alias 이름 목록과 함수 이름 목록 추출
     local existing_names
     existing_names="$(
-        grep -oP 'alias \K[^=]+' "$existing_file" 2>/dev/null | sed "s/'$//"
-        grep -oP '^\w+(?=\(\))' "$existing_file" 2>/dev/null
+        sed -n "s/^alias \([^=]*\)=.*/\1/p" "$existing_file" 2>/dev/null | sed "s/'$//"
+        sed -n "s/^\([a-zA-Z_][a-zA-Z0-9_]*\)().*/\1/p" "$existing_file" 2>/dev/null
     )"
 
     local tmp_append
@@ -218,8 +221,8 @@ _merge_aliases() {
 
     while IFS= read -r line || [ -n "$line" ]; do
         # 여러 줄 함수 블록 시작 감지: name() {
-        if echo "$line" | grep -qP '^\w+\(\)\s*\{'; then
-            func_name="$(echo "$line" | grep -oP '^\w+(?=\(\))')"
+        if echo "$line" | grep -qE '^[a-zA-Z_][a-zA-Z0-9_]*\(\)[[:space:]]*\{'; then
+            func_name="$(echo "$line" | sed -n 's/^\([a-zA-Z_][a-zA-Z0-9_]*\)().*/\1/p')"
             in_func_block=true
             if echo "$existing_names" | grep -qx "$func_name"; then
                 skip_block=true
@@ -236,7 +239,7 @@ _merge_aliases() {
             if [ "$skip_block" = false ]; then
                 echo "$line" >> "$tmp_append"
             fi
-            if echo "$line" | grep -qP '^\}'; then
+            if echo "$line" | grep -q '^\}'; then
                 in_func_block=false
                 func_name=""
                 skip_block=false
@@ -245,9 +248,9 @@ _merge_aliases() {
         fi
 
         # alias 라인 처리
-        if echo "$line" | grep -qP '^alias '; then
+        if echo "$line" | grep -q '^alias '; then
             local alias_name
-            alias_name="$(echo "$line" | grep -oP 'alias \K[^=]+')"
+            alias_name="$(echo "$line" | sed -n 's/^alias \([^=]*\)=.*/\1/p')"
             if echo "$existing_names" | grep -qx "$alias_name"; then
                 continue  # 이미 존재 → 스킵
             fi
@@ -257,7 +260,7 @@ _merge_aliases() {
         fi
 
         # export PATH 라인 처리 (export로 시작하는 일반 명령문)
-        if echo "$line" | grep -qP '^export '; then
+        if echo "$line" | grep -q '^export '; then
             if grep -qF "$line" "$existing_file" 2>/dev/null; then
                 continue  # 동일 라인 이미 존재 → 스킵
             fi
@@ -296,6 +299,13 @@ setup_shell_aliases() {
     local shell_name="$DETECTED_SHELL_NAME" shell_rc="$DETECTED_SHELL_RC"
     if [ "$shell_name" != "zsh" ] && [ "$shell_name" != "bash" ]; then
         print_info "감지된 쉘: $shell_name (bash 설정으로 대체합니다)"
+    fi
+    # wrapper 스크립트 실행 권한 부여
+    if ls "$SCRIPT_DIR/bin/flow-"* &>/dev/null 2>&1; then
+        chmod +x "$SCRIPT_DIR/bin/flow-"*
+        print_success "wrapper 스크립트 실행 권한 부여 완료 ($SCRIPT_DIR/bin/flow-*)"
+    else
+        print_info "wrapper 스크립트 없음 ($SCRIPT_DIR/bin/flow-*). chmod 스킵"
     fi
     # .claude.aliases 파일이 이미 존재하면 머지 (신규 alias/함수만 추가)
     if [ -f "$aliases_file" ]; then
@@ -435,7 +445,7 @@ _merge_kv_settings() {
 
     # 기존 파일에서 KEY 목록 추출 (대문자+언더스코어 시작)
     local existing_keys
-    existing_keys="$(grep -oP '^[A-Z_][A-Z0-9_]+(?==)' "$existing_file" 2>/dev/null)"
+    existing_keys="$(sed -n 's/^\([A-Z_][A-Z0-9_]*\)=.*/\1/p' "$existing_file" 2>/dev/null)"
 
     local tmp_append
     tmp_append="$(mktemp)" || return 1
@@ -447,9 +457,9 @@ _merge_kv_settings() {
 
     while IFS= read -r line || [ -n "$line" ]; do
         # KEY=VALUE 라인 감지
-        if echo "$line" | grep -qP '^[A-Z_][A-Z0-9_]+='; then
+        if echo "$line" | grep -qE '^[A-Z_][A-Z0-9_]+='; then
             local key
-            key="$(echo "$line" | grep -oP '^[A-Z_][A-Z0-9_]+(?==)')"
+            key="$(echo "$line" | sed -n 's/^\([A-Z_][A-Z0-9_]*\)=.*/\1/p')"
             if echo "$existing_keys" | grep -qx "$key"; then
                 # 기존에 존재 → 스킵, 누적 주석 초기화
                 pending_comments=()
@@ -466,7 +476,7 @@ _merge_kv_settings() {
         fi
 
         # 주석 또는 빈 줄: 다음 KEY를 위해 누적
-        if echo "$line" | grep -qP '^#' || [ -z "$line" ]; then
+        if echo "$line" | grep -q '^#' || [ -z "$line" ]; then
             pending_comments+=("$line")
         else
             # 그 외 라인 (export 등): 전체 라인 매칭
@@ -605,6 +615,7 @@ cleanup_legacy_claude_paths() {
 
 # --- Step 3.6: 레거시 alias 경로 갱신 ---
 # ~/.claude.aliases 내 구 경로(.claude/scripts/, .claude/hooks/)를 신 경로로 치환
+# 추가: flow-* alias 정의를 제거하고 wrapper PATH 설정으로 대체 (alias → wrapper 마이그레이션)
 update_legacy_aliases() {
     print_step "3.6" "레거시 alias 경로 갱신"
     local aliases_file="$HOME/.claude.aliases"
@@ -627,8 +638,96 @@ update_legacy_aliases() {
     fi
     # macOS sed -i 백업 파일 정리
     rm -f "${aliases_file}.mig-bak"
+
+    # --- flow-* alias → wrapper PATH 마이그레이션 ---
+    # ~/.claude.aliases에 남아있는 'alias flow-xxx=...' 패턴을 감지하여 제거하고
+    # .claude.workflow/bin/ wrapper PATH 설정으로 대체
+    if grep -qE '^alias flow-[a-zA-Z_][a-zA-Z0-9_-]*=' "$aliases_file" 2>/dev/null; then
+        _MIGRATION_PERFORMED=true
+        local flow_alias_count
+        flow_alias_count="$(grep -cE '^alias flow-[a-zA-Z_][a-zA-Z0-9_-]*=' "$aliases_file" 2>/dev/null || echo 0)"
+        print_info "flow-* alias ${flow_alias_count}개 감지됨. wrapper PATH 설정으로 마이그레이션합니다..."
+
+        local tmp_migrated
+        tmp_migrated="$(mktemp)" || return 1
+
+        # flow-* alias 라인 제거 (연속된 flow-* alias 블록의 직전 섹션 주석도 제거)
+        python3 - "$aliases_file" "$tmp_migrated" <<'PYEOF'
+import sys, re
+
+src_path, dst_path = sys.argv[1], sys.argv[2]
+
+with open(src_path, 'r') as f:
+    lines = f.readlines()
+
+# flow-* alias 패턴
+flow_alias_re = re.compile(r'^alias flow-\w+=')
+
+output = []
+i = 0
+while i < len(lines):
+    line = lines[i]
+    # flow-* alias 라인은 스킵
+    if flow_alias_re.match(line):
+        i += 1
+        continue
+    # 직전 주석이 flow-* alias 전용 섹션 주석인지 확인
+    # (주석 다음 라인이 flow-* alias이면 해당 주석도 제거)
+    stripped = line.rstrip('\n')
+    if stripped.startswith('#') and i + 1 < len(lines):
+        next_line = lines[i + 1]
+        if flow_alias_re.match(next_line):
+            # 이 주석은 flow-* alias 블록 직전 주석 → 스킵
+            i += 1
+            continue
+    output.append(line)
+    i += 1
+
+# 연속 빈 줄 3개 이상 → 2개로 압축
+result = []
+blank_count = 0
+for line in output:
+    if line.strip() == '':
+        blank_count += 1
+        if blank_count <= 2:
+            result.append(line)
+    else:
+        blank_count = 0
+        result.append(line)
+
+with open(dst_path, 'w') as f:
+    f.writelines(result)
+PYEOF
+
+        if [ $? -ne 0 ]; then
+            print_error "flow-* alias 마이그레이션 Python 처리 실패. 기존 파일 유지."
+            rm -f "$tmp_migrated"
+        else
+            mv "$tmp_migrated" "$aliases_file"
+            changed=$((changed + 1))
+            print_success "flow-* alias ${flow_alias_count}개 제거 완료"
+
+            # wrapper PATH 설정이 이미 존재하는지 확인 후 없으면 추가
+            local wrapper_path_marker=".claude.workflow/bin"
+            if grep -q "$wrapper_path_marker" "$aliases_file" 2>/dev/null; then
+                print_info "wrapper PATH 설정이 이미 존재합니다. 추가 스킵"
+            else
+                cat >> "$aliases_file" <<'WRAPPER_PATH'
+
+# flow-* wrapper (프로젝트별 동적 PATH)
+_cwf_root="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [ -n "$_cwf_root" ] && [ -d "$_cwf_root/.claude.workflow/bin" ]; then
+  export PATH="$_cwf_root/.claude.workflow/bin:$PATH"
+fi
+unset _cwf_root
+WRAPPER_PATH
+                print_success "wrapper PATH 설정 추가 완료 (~/.claude.aliases)"
+            fi
+        fi
+    fi
+
     if [ "$changed" -gt 0 ]; then
-        print_success "alias 경로 치환 완료 (${changed}개 패턴)"
+        print_success "alias 경로 갱신 완료 (${changed}개 패턴 처리)"
     else
         print_info "레거시 경로 패턴 없음. 갱신 불필요"
     fi
@@ -710,7 +809,7 @@ clone_claude_directory() {
     if [ -d "$tmp_dir/claude-workflow/.claude.workflow" ]; then
         # 사용자 데이터 백업 (kanban, workflow, .settings, .env, .version)
         local preserve_dirs=("kanban" "workflow" "dashboard")
-        local preserve_files=(".settings" ".env" ".version" ".board.url" ".terminal.url" "build.url")
+        local preserve_files=(".settings" ".env" ".version" ".board.url" "build.url")
         for pd in "${preserve_dirs[@]}"; do
             [ -d ".claude.workflow/$pd" ] && cp -r ".claude.workflow/$pd" "$tmp_dir/_preserve_$pd"
         done
@@ -757,8 +856,12 @@ verify_installation() {
     else
         print_error "python3 명령어를 찾을 수 없습니다"; failed=$((failed + 1))
     fi
-    # (b) tmux / gh / claude 검증
-    _verify_command "tmux" "tmux" || failed=$((failed + 1))
+    # (b) gh / claude 검증 (tmux는 선택 사항 — 없어도 실패 아님)
+    if command -v tmux &>/dev/null; then
+        print_success "tmux 실행 가능 (선택 사항, $(tmux -V 2>/dev/null || echo 'version unknown'))"
+    else
+        print_warning "tmux 명령어를 찾을 수 없습니다 (선택 사항 — tmux 폴백 경로만 비활성화됨)"
+    fi
     _verify_command "gh"   "gh CLI" || failed=$((failed + 1))
     if command -v claude &>/dev/null; then print_success "claude 명령어 실행 가능"
     else print_error "claude 명령어를 찾을 수 없습니다"; failed=$((failed + 1)); fi

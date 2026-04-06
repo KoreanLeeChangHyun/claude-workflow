@@ -13,6 +13,7 @@ ThreadingHTTPServer 기반 커스텀 서버로, 정적 파일 서빙과 /events 
 from __future__ import annotations
 
 import atexit
+import collections
 import hashlib
 import json
 import logging
@@ -24,6 +25,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 logger = logging.getLogger(__name__)
@@ -204,12 +206,14 @@ class SSEClientManager:
     Attributes:
         _clients: 연결된 클라이언트의 wfile 객체 목록
         _lock: 클라이언트 목록 접근용 Lock
+        _client_locks: wfile별 per-client Lock 딕셔너리
     """
 
     def __init__(self) -> None:
         """초기화한다."""
         self._clients: list = []
         self._lock: threading.Lock = threading.Lock()
+        self._client_locks: dict = {}
 
     def add(self, wfile: object) -> None:
         """클라이언트를 추가한다.
@@ -219,6 +223,7 @@ class SSEClientManager:
         """
         with self._lock:
             self._clients.append(wfile)
+            self._client_locks[id(wfile)] = threading.Lock()
 
     def remove(self, wfile: object) -> None:
         """클라이언트를 제거한다.
@@ -231,33 +236,61 @@ class SSEClientManager:
                 self._clients.remove(wfile)
             except ValueError:
                 pass
+            self._client_locks.pop(id(wfile), None)
 
-    def broadcast(self, event_type: str) -> None:
+    def get_lock(self, wfile: object) -> threading.Lock | None:
+        """wfile에 대응하는 per-client lock을 반환한다.
+
+        Args:
+            wfile: lock을 획득할 클라이언트의 wfile
+
+        Returns:
+            해당 wfile의 Lock. 클라이언트가 존재하지 않으면 None.
+        """
+        with self._lock:
+            return self._client_locks.get(id(wfile))
+
+    def broadcast(self, event_type: str, files: list | None = None) -> None:
         """모든 클라이언트에 SSE 이벤트를 전송한다.
 
         전송 실패한 클라이언트(연결 끊김)는 목록에서 제거한다.
+        per-client lock으로 heartbeat 루프와의 concurrent write를 방지한다.
 
         Args:
             event_type: SSE 이벤트 타입 (kanban, workflow, dashboard)
+            files: 변경된 파일 목록. kanban 이벤트 시 data 필드에 JSON으로 포함됨.
+                   None이면 타임스탬프 문자열을 data로 전송.
         """
-        timestamp = str(int(time.time()))
-        message = f"event: {event_type}\ndata: {timestamp}\n\n"
+        if files is not None:
+            data = json.dumps({"files": files})
+        else:
+            data = str(int(time.time()))
+        message = f"event: {event_type}\ndata: {data}\n\n"
         encoded = message.encode('utf-8')
 
         dead_clients: list = []
         with self._lock:
-            for wfile in self._clients:
-                try:
+            clients_snapshot = list(self._clients)
+
+        for wfile in clients_snapshot:
+            client_lock = self._client_locks.get(id(wfile))
+            if client_lock is None:
+                continue
+            try:
+                with client_lock:
                     wfile.write(encoded)
                     wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    dead_clients.append(wfile)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                dead_clients.append(wfile)
 
-            for wfile in dead_clients:
-                try:
-                    self._clients.remove(wfile)
-                except ValueError:
-                    pass
+        if dead_clients:
+            with self._lock:
+                for wfile in dead_clients:
+                    try:
+                        self._clients.remove(wfile)
+                    except ValueError:
+                        pass
+                    self._client_locks.pop(id(wfile), None)
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +308,27 @@ _NDJSON_EVENT_MAP: dict[str, str] = {
 }
 
 
+def _parse_last_event_id(headers: object) -> int:
+    """HTTP 요청 헤더에서 Last-Event-ID를 파싱한다.
+
+    브라우저 EventSource는 재접속 시 자동으로 마지막 수신 이벤트의 id를
+    Last-Event-ID 헤더에 담아 전송한다.
+
+    Args:
+        headers: HTTP 요청 헤더 객체
+
+    Returns:
+        파싱된 정수 ID. 헤더 없거나 파싱 실패 시 -1.
+    """
+    try:
+        raw = headers.get('Last-Event-ID')
+        if raw is None:
+            return -1
+        return int(str(raw).strip())
+    except (ValueError, AttributeError):
+        return -1
+
+
 class TerminalSSEChannel:
     """터미널 출력 전용 SSE 브로드캐스트 채널.
 
@@ -286,21 +340,64 @@ class TerminalSSEChannel:
     Attributes:
         _clients: 연결된 클라이언트의 wfile 객체 목록
         _lock: 클라이언트 목록 접근용 Lock
+        _history: 최근 SSE 이벤트 링 버퍼 (재접속 시 재생용)
     """
 
-    def __init__(self) -> None:
-        """초기화한다."""
+    def __init__(self, history_size: int = 1000, persist_path: str | None = None) -> None:
+        """초기화한다.
+
+        Args:
+            history_size: 링 버퍼에 보관할 최근 이벤트 개수. 0이면 버퍼 비활성.
+            persist_path: 이벤트를 저장할 JSONL 파일 경로. None이면 persist 비활성.
+        """
         self._clients: list = []
         self._lock: threading.Lock = threading.Lock()
+        # 이벤트를 (seq_id, encoded) 튜플로 저장해 Last-Event-ID 기반 재개 지원
+        self._history: collections.deque = collections.deque(maxlen=history_size)
+        self._next_seq: int = 0
+        self._persist_path: str | None = persist_path
+        self._persist_lock: threading.Lock = threading.Lock()
 
-    def add(self, wfile: object) -> None:
-        """클라이언트를 추가한다.
+    def add(self, wfile: object, last_event_id: int = -1) -> None:
+        """클라이언트를 추가하고, last_event_id 이후의 히스토리를 재생한다.
 
         Args:
             wfile: HTTP 핸들러의 wfile (소켓 출력 스트림)
+            last_event_id: 클라이언트가 마지막으로 수신한 이벤트 seq_id (-1=전체 재생)
         """
         with self._lock:
             self._clients.append(wfile)
+            for seq_id, encoded in list(self._history):
+                if seq_id <= last_event_id:
+                    continue  # 이미 수신한 이벤트는 건너뜀
+                try:
+                    wfile.write(encoded)
+                    wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    break
+
+    def clear_history(self) -> None:
+        """히스토리 버퍼를 비운다. 새 세션 시작 시 이전 이벤트를 제거하기 위함."""
+        with self._lock:
+            self._history.clear()
+            self._next_seq = 0
+
+    def replay_from_history(self, data: dict) -> None:
+        """이전에 저장된 이벤트를 히스토리 버퍼에만 복원한다.
+
+        서버 재시작 후 persist 파일에서 이벤트를 로드할 때 사용한다.
+        클라이언트 브로드캐스트와 파일 쓰기는 수행하지 않는다.
+
+        Args:
+            data: 파싱된 NDJSON 메시지 dict
+        """
+        event_name = self._classify_event(data)
+        payload = self._build_payload(data, event_name)
+        json_payload = json.dumps(payload, ensure_ascii=False)
+        seq_id = self._next_seq
+        self._next_seq += 1
+        message = f"id: {seq_id}\nevent: {event_name}\ndata: {json_payload}\n\n"
+        self._history.append((seq_id, message.encode('utf-8')))
 
     def remove(self, wfile: object) -> None:
         """클라이언트를 제거한다.
@@ -333,11 +430,16 @@ class TerminalSSEChannel:
         event_name = self._classify_event(data)
         payload = self._build_payload(data, event_name)
         json_payload = json.dumps(payload, ensure_ascii=False)
-        message = f"event: {event_name}\ndata: {json_payload}\n\n"
-        encoded = message.encode('utf-8')
 
         dead_clients: list = []
         with self._lock:
+            seq_id = self._next_seq
+            self._next_seq += 1
+            # SSE `id:` 필드 → 브라우저가 자동으로 Last-Event-ID 재송신
+            message = f"id: {seq_id}\nevent: {event_name}\ndata: {json_payload}\n\n"
+            encoded = message.encode('utf-8')
+            # 링 버퍼에 (seq_id, encoded) 튜플로 저장
+            self._history.append((seq_id, encoded))
             for wfile in self._clients:
                 try:
                     wfile.write(encoded)
@@ -350,6 +452,16 @@ class TerminalSSEChannel:
                     self._clients.remove(wfile)
                 except ValueError:
                     pass
+
+        # 파일 persist (서버 재시작 시 복원용) - 별도 락 사용
+        if self._persist_path is not None:
+            try:
+                line = json.dumps(data, ensure_ascii=False) + '\n'
+                with self._persist_lock:
+                    with open(self._persist_path, 'a', encoding='utf-8') as f:
+                        f.write(line)
+            except (OSError, TypeError):
+                pass  # persist 실패는 세션 동작을 막지 않는다
 
     def _classify_event(self, data: dict) -> str:
         """NDJSON 메시지 타입으로부터 SSE 이벤트 이름을 결정한다.
@@ -536,7 +648,11 @@ class ClaudeProcess:
         self._channel: TerminalSSEChannel = channel
         self._init_event: threading.Event = threading.Event()
 
-    def spawn(self, extra_args: list[str] | None = None) -> dict:
+    def spawn(
+        self,
+        extra_args: list[str] | None = None,
+        env_extras: dict[str, str] | None = None,
+    ) -> dict:
         """Claude CLI 프로세스를 시작한다.
 
         이미 실행 중인 프로세스가 있으면 먼저 종료한다.
@@ -545,6 +661,8 @@ class ClaudeProcess:
 
         Args:
             extra_args: 추가 CLI 인자 목록 (선택적)
+            env_extras: 자식 프로세스에 주입할 추가 환경변수 dict (선택적).
+                        예: {"_WF_SESSION_TYPE": "workflow", "_WF_TICKET_ID": "T-238"}
 
         Returns:
             시작 결과 dict: {"ok": True/False, "session_id": str, "error": str}
@@ -571,6 +689,11 @@ class ClaudeProcess:
 
         self._init_event.clear()
 
+        # env_extras가 지정되면 현재 환경에 추가 환경변수를 병합
+        proc_env = None
+        if env_extras:
+            proc_env = {**os.environ, **env_extras}
+
         try:
             self._process = subprocess.Popen(
                 cmd,
@@ -579,6 +702,7 @@ class ClaudeProcess:
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
+                env=proc_env,
             )
         except FileNotFoundError:
             self._status = 'stopped'
@@ -828,6 +952,275 @@ terminal_sse_channel: TerminalSSEChannel = TerminalSSEChannel()
 claude_process: ClaudeProcess = ClaudeProcess(terminal_sse_channel)
 
 
+# ---------------------------------------------------------------------------
+# Workflow Session Management (다중 워크플로우 세션)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WorkflowSession:
+    """워크플로우 세션 하나를 나타내는 데이터 클래스.
+
+    각 워크플로우 티켓 실행은 독립된 ClaudeProcess와 TerminalSSEChannel을
+    가지며, session_id로 식별된다.
+
+    Attributes:
+        session_id: 세션 고유 ID (형식: wf-T-NNN-timestamp)
+        ticket_id: 칸반 티켓 ID (예: T-238)
+        command: 실행 명령어 (implement, review, research 등)
+        work_dir: 작업 디렉터리 절대 경로
+        process: Claude CLI 프로세스 관리자 인스턴스
+        channel: 터미널 SSE 브로드캐스트 채널 인스턴스
+        created_at: 세션 생성 시각 (ISO 형식)
+        current_step: 현재 진행 중인 워크플로우 단계 (예: PLAN, WORK, REPORT)
+        last_artifact: 최근 생성된 산출물 경로 (예: work/W01-design.md)
+    """
+
+    session_id: str
+    ticket_id: str
+    command: str
+    work_dir: str
+    process: ClaudeProcess = field(repr=False)
+    channel: TerminalSSEChannel = field(repr=False)
+    created_at: str = field(default_factory=lambda: time.strftime('%Y-%m-%dT%H:%M:%S'))
+    current_step: str = ''
+    last_artifact: str = ''
+
+
+class WorkflowSessionRegistry:
+    """다중 워크플로우 세션 레지스트리.
+
+    thread-safe하게 워크플로우 세션을 생성·조회·삭제한다.
+    각 세션은 독립된 ClaudeProcess + TerminalSSEChannel 쌍을 보유한다.
+
+    Attributes:
+        _sessions: session_id -> WorkflowSession 매핑
+        _lock: thread-safe 접근용 Lock
+    """
+
+    def __init__(self, persist_dir: str | None = None) -> None:
+        """초기화한다.
+
+        Args:
+            persist_dir: 세션을 저장할 디렉터리. None이면 persist 비활성.
+        """
+        self._sessions: dict[str, WorkflowSession] = {}
+        self._lock: threading.Lock = threading.Lock()
+        self._persist_dir: str | None = persist_dir
+        if self._persist_dir is not None:
+            try:
+                os.makedirs(self._persist_dir, exist_ok=True)
+            except OSError:
+                self._persist_dir = None
+
+    def _session_file(self, session_id: str) -> str | None:
+        """세션 이벤트 파일 경로를 반환한다."""
+        if self._persist_dir is None:
+            return None
+        return os.path.join(self._persist_dir, f'{session_id}.jsonl')
+
+    def create(
+        self,
+        ticket_id: str,
+        command: str,
+        work_dir: str,
+    ) -> WorkflowSession:
+        """새 워크플로우 세션을 생성한다.
+
+        독립된 TerminalSSEChannel과 ClaudeProcess 인스턴스를 할당하고,
+        session_id를 생성하여 레지스트리에 등록한다.
+
+        Args:
+            ticket_id: 칸반 티켓 ID (예: T-238)
+            command: 실행 명령어 (implement, review, research 등)
+            work_dir: 작업 디렉터리 절대 경로
+
+        Returns:
+            생성된 WorkflowSession 인스턴스
+        """
+        timestamp = time.strftime('%Y%m%d-%H%M%S')
+        session_id = f'wf-{ticket_id}-{timestamp}'
+
+        persist_path = self._session_file(session_id)
+        channel = TerminalSSEChannel(persist_path=persist_path)
+        process = ClaudeProcess(channel)
+
+        session = WorkflowSession(
+            session_id=session_id,
+            ticket_id=ticket_id,
+            command=command,
+            work_dir=work_dir,
+            process=process,
+            channel=channel,
+        )
+
+        # 메타데이터를 파일 첫 줄에 기록
+        if persist_path is not None:
+            try:
+                meta = {
+                    '_meta': {
+                        'session_id': session_id,
+                        'ticket_id': ticket_id,
+                        'command': command,
+                        'work_dir': work_dir,
+                        'created_at': session.created_at,
+                    }
+                }
+                with open(persist_path, 'w', encoding='utf-8') as f:
+                    f.write(json.dumps(meta, ensure_ascii=False) + '\n')
+            except OSError:
+                pass
+
+        with self._lock:
+            self._sessions[session_id] = session
+
+        return session
+
+    def load_from_disk(self) -> int:
+        """persist 디렉터리에서 세션을 로드하여 레지스트리를 복원한다.
+
+        각 *.jsonl 파일을 읽어:
+          - 첫 줄의 _meta로 WorkflowSession 객체를 재생성
+          - 나머지 줄의 이벤트들을 채널 히스토리에 복원
+          - process는 새 ClaudeProcess (status='stopped')로 생성
+
+        Returns:
+            로드된 세션 개수
+        """
+        if self._persist_dir is None or not os.path.isdir(self._persist_dir):
+            return 0
+
+        loaded = 0
+        for fname in sorted(os.listdir(self._persist_dir)):
+            if not fname.endswith('.jsonl'):
+                continue
+            fpath = os.path.join(self._persist_dir, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+            except OSError:
+                continue
+            if not lines:
+                continue
+            try:
+                first = json.loads(lines[0])
+                meta = first.get('_meta')
+                if not meta or not meta.get('session_id'):
+                    continue
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+            channel = TerminalSSEChannel(persist_path=fpath)
+            process = ClaudeProcess(channel)
+            session = WorkflowSession(
+                session_id=meta['session_id'],
+                ticket_id=meta.get('ticket_id', ''),
+                command=meta.get('command', ''),
+                work_dir=meta.get('work_dir', ''),
+                process=process,
+                channel=channel,
+                created_at=meta.get('created_at', time.strftime('%Y-%m-%dT%H:%M:%S')),
+            )
+
+            # 이벤트 복원 (파일 쓰기 없이 히스토리만)
+            for line in lines[1:]:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    channel.replay_from_history(data)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
+            with self._lock:
+                self._sessions[session.session_id] = session
+            loaded += 1
+
+        return loaded
+
+    def purge(self, session_id: str) -> bool:
+        """세션을 레지스트리와 디스크에서 완전히 제거한다."""
+        removed = self.remove(session_id)
+        if removed and self._persist_dir is not None:
+            fpath = self._session_file(session_id)
+            if fpath and os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                except OSError:
+                    pass
+        return removed
+
+    def get(self, session_id: str) -> WorkflowSession | None:
+        """session_id로 세션을 조회한다.
+
+        Args:
+            session_id: 조회할 세션 ID
+
+        Returns:
+            WorkflowSession 인스턴스. 존재하지 않으면 None.
+        """
+        with self._lock:
+            return self._sessions.get(session_id)
+
+    def remove(self, session_id: str) -> bool:
+        """세션을 레지스트리에서 제거한다.
+
+        프로세스 종료는 호출자가 별도로 처리해야 한다.
+
+        Args:
+            session_id: 제거할 세션 ID
+
+        Returns:
+            제거 성공 시 True, 세션이 존재하지 않으면 False.
+        """
+        with self._lock:
+            if session_id in self._sessions:
+                del self._sessions[session_id]
+                return True
+            return False
+
+    def list_all(self) -> list[dict]:
+        """전체 세션 목록을 dict 리스트로 반환한다.
+
+        Returns:
+            세션 메타데이터 dict 리스트. 각 dict 키:
+            session_id, ticket_id, command, work_dir, status, created_at
+        """
+        with self._lock:
+            return [
+                {
+                    'session_id': s.session_id,
+                    'ticket_id': s.ticket_id,
+                    'command': s.command,
+                    'work_dir': s.work_dir,
+                    'status': s.process.status,
+                    'created_at': s.created_at,
+                }
+                for s in self._sessions.values()
+            ]
+
+    def get_by_ticket(self, ticket_id: str) -> WorkflowSession | None:
+        """티켓 ID로 세션을 조회한다.
+
+        동일 티켓에 여러 세션이 있을 경우 첫 번째 매칭을 반환한다.
+
+        Args:
+            ticket_id: 조회할 티켓 ID (예: T-238)
+
+        Returns:
+            WorkflowSession 인스턴스. 존재하지 않으면 None.
+        """
+        with self._lock:
+            for session in self._sessions.values():
+                if session.ticket_id == ticket_id:
+                    return session
+            return None
+
+
+# 모듈 레벨 워크플로우 세션 레지스트리 싱글톤
+workflow_registry: WorkflowSessionRegistry = WorkflowSessionRegistry()
+
+
 KANBAN_DIRS_LIST: list[str] = ['open', 'progress', 'review', 'done']
 WF_BASE: str = os.path.join('.claude.workflow', 'workflow')
 WF_HISTORY: str = os.path.join('.claude.workflow', 'workflow', '.history')
@@ -1032,6 +1425,22 @@ def _list_workflow_entries(project_root: str) -> list[str]:
     return entries
 
 
+def _get_git_branch(project_root: str) -> str:
+    """현재 git 브랜치명을 반환한다.
+
+    git 명령 실행 실패 또는 타임아웃 시 빈 문자열을 반환한다.
+    """
+    try:
+        result = subprocess.run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            capture_output=True, text=True, timeout=3,
+            cwd=project_root,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ''
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ''
+
+
 def _workflow_detail(project_root: str, entry_rel: str) -> list[dict]:
     """워크플로우 엔트리 1개의 상세 정보를 반환한다."""
     entry_name = entry_rel.rstrip('/').rsplit('/', 1)[-1]
@@ -1113,6 +1522,12 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
             self._handle_terminal_sse()
         elif self.path == '/terminal/status':
             self._handle_terminal_status()
+        elif self.path.startswith('/terminal/workflow/status'):
+            self._handle_workflow_status()
+        elif self.path.startswith('/terminal/workflow/events'):
+            self._handle_workflow_sse()
+        elif self.path == '/terminal/workflow/list':
+            self._handle_workflow_list()
         elif self.path.startswith('/api/'):
             self._handle_api()
         else:
@@ -1138,6 +1553,12 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
             self._handle_terminal_input()
         elif self.path == '/terminal/kill':
             self._handle_terminal_kill()
+        elif self.path == '/terminal/workflow/start':
+            self._handle_workflow_start()
+        elif self.path == '/terminal/workflow/kill':
+            self._handle_workflow_kill()
+        elif self.path == '/terminal/workflow/input':
+            self._handle_workflow_input()
         else:
             self.send_response(404)
             self.end_headers()
@@ -1204,16 +1625,9 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
                 'started_at': SERVER_STARTED_AT,
             })
         elif path == '/api/branch':
-            try:
-                result = subprocess.run(
-                    ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
-                    capture_output=True, text=True, timeout=3,
-                    cwd=project_root,
-                )
-                branch = result.stdout.strip() if result.returncode == 0 else ''
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                branch = ''
-            self._send_json({'branch': branch})
+            self._send_json({'branch': _get_git_branch(project_root)})
+        elif path == '/api/workflow/artifact':
+            self._handle_workflow_artifact(qs)
         else:
             self.send_response(404)
             self.end_headers()
@@ -1257,9 +1671,13 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
             while True:
                 time.sleep(1)
                 # keep-alive 주석 전송으로 연결 상태 확인
+                client_lock = sse_manager.get_lock(self.wfile)
+                if client_lock is None:
+                    break
                 try:
-                    self.wfile.write(b': heartbeat\n\n')
-                    self.wfile.flush()
+                    with client_lock:
+                        self.wfile.write(b': heartbeat\n\n')
+                        self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     break
         finally:
@@ -1288,7 +1706,9 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             return
 
-        terminal_sse_channel.add(self.wfile)
+        # 재접속 시 Last-Event-ID로 중복 재생 방지
+        last_event_id = _parse_last_event_id(self.headers)
+        terminal_sse_channel.add(self.wfile, last_event_id=last_event_id)
         try:
             while True:
                 time.sleep(1)
@@ -1305,11 +1725,13 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
 
         GET /terminal/status: Claude 프로세스의 현재 상태를 JSON으로 응답한다.
         """
+        project_root = os.getcwd()
         self._send_json({
             'status': claude_process.status,
             'session_id': claude_process.session_id,
             'model': claude_process._model,
             'permission_mode': claude_process._permission_mode,
+            'branch': _get_git_branch(project_root),
             'clients': terminal_sse_channel.client_count,
         })
 
@@ -1328,6 +1750,9 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
                 extra_args = data.get('args')
             except (json.JSONDecodeError, AttributeError):
                 pass
+
+        # 새 세션 시작 시 이전 이벤트 히스토리 초기화
+        terminal_sse_channel.clear_history()
 
         result = claude_process.spawn(extra_args)
         self._send_json(result)
@@ -1377,6 +1802,351 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
 
         result = claude_process.kill()
         self._send_json(result)
+
+    # -- Workflow Session API handlers ----------------------------------------
+
+    def _parse_query_param(self, key: str) -> str | None:
+        """URL 쿼리 파라미터에서 지정한 키의 값을 추출한다.
+
+        Args:
+            key: 추출할 쿼리 파라미터 키
+
+        Returns:
+            파라미터 값 문자열. 존재하지 않으면 None.
+        """
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(self.path)
+        values = parse_qs(parsed.query).get(key)
+        return values[0] if values else None
+
+    def _read_json_body(self) -> dict | None:
+        """POST 요청의 JSON 본문을 파싱하여 반환한다.
+
+        파싱 실패 시 400 에러를 전송하고 None을 반환한다.
+
+        Returns:
+            파싱된 dict. 실패 시 None.
+        """
+        content_length = int(self.headers.get('Content-Length', 0))
+        if content_length == 0:
+            self._send_error(400, 'Empty request body')
+            return None
+
+        body = self.rfile.read(content_length)
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            self._send_error(400, 'Invalid JSON')
+            return None
+
+        if not isinstance(data, dict):
+            self._send_error(400, 'Expected JSON object')
+            return None
+
+        return data
+
+    def _handle_workflow_start(self) -> None:
+        """워크플로우 세션 시작 엔드포인트를 처리한다.
+
+        POST /terminal/workflow/start
+        요청 본문: {"ticket": "T-NNN", "command": "implement", "work_dir": "/path/..."}
+
+        워크플로우 레지스트리에 새 세션을 생성하고, Claude CLI 프로세스를 시작한다.
+        프로세스 환경변수에 _WF_SESSION_TYPE, _WF_TICKET_ID, _WF_SESSION_ID,
+        _WF_SERVER_PORT를 주입한다.
+        """
+        data = self._read_json_body()
+        if data is None:
+            return
+
+        ticket = data.get('ticket', '')
+        command = data.get('command', '')
+        work_dir = data.get('work_dir', '')
+
+        if not ticket:
+            self._send_error(400, 'Missing "ticket" field')
+            return
+        if not command:
+            self._send_error(400, 'Missing "command" field')
+            return
+
+        session = workflow_registry.create(ticket, command, work_dir)
+
+        # 서버 포트 추출
+        server_port = str(self.server.server_address[1])
+
+        env_extras = {
+            '_WF_SESSION_TYPE': 'workflow',
+            '_WF_TICKET_ID': ticket,
+            '_WF_SESSION_ID': session.session_id,
+            '_WF_SERVER_PORT': server_port,
+        }
+
+        spawn_result = session.process.spawn(env_extras=env_extras)
+
+        if not spawn_result.get('ok'):
+            # 프로세스 시작 실패 시 레지스트리에서 제거
+            workflow_registry.remove(session.session_id)
+            self._send_error(500, spawn_result.get('error', 'Failed to start process'))
+            return
+
+        # launcher가 전달한 command를 세션에 자동 주입
+        if command:
+            session.process.send_input(command)
+
+        self._send_json({
+            'ok': True,
+            'session_id': session.session_id,
+        })
+
+    def _handle_workflow_kill(self) -> None:
+        """워크플로우 세션 프로세스를 종료한다. (세션 메타와 SSE 이력은 유지)
+
+        POST /terminal/workflow/kill
+        요청 본문: {"session_id": "wf-T-NNN-..."}
+        선택 필드: "purge": true → 세션 메타까지 레지스트리에서 완전히 제거
+
+        기본 동작: 프로세스만 kill, 세션/채널은 레지스트리에 남겨 SSE 재접속 시
+        이력 재생이 가능하도록 유지한다. 명시적 purge 요청 시에만 완전 제거한다.
+        """
+        data = self._read_json_body()
+        if data is None:
+            return
+
+        session_id = data.get('session_id', '')
+        purge = bool(data.get('purge', False))
+        if not session_id:
+            self._send_error(400, 'Missing "session_id" field')
+            return
+
+        session = workflow_registry.get(session_id)
+        if session is None:
+            self._send_error(404, f'Session not found: {session_id}')
+            return
+
+        session.process.kill()
+        if purge:
+            workflow_registry.purge(session_id)
+
+        self._send_json({'ok': True, 'purged': purge})
+
+    def _handle_workflow_input(self) -> None:
+        """워크플로우 세션 입력 전송 엔드포인트를 처리한다.
+
+        POST /terminal/workflow/input
+        요청 본문: {"session_id": "wf-T-NNN-...", "text": "사용자 메시지"}
+
+        지정된 세션의 Claude CLI 프로세스에 사용자 메시지를 전송한다.
+        """
+        data = self._read_json_body()
+        if data is None:
+            return
+
+        session_id = data.get('session_id', '')
+        if not session_id:
+            self._send_error(400, 'Missing "session_id" field')
+            return
+
+        text = data.get('text', '')
+        if not text:
+            self._send_error(400, 'Missing "text" field')
+            return
+
+        session = workflow_registry.get(session_id)
+        if session is None:
+            self._send_error(404, f'Session not found: {session_id}')
+            return
+
+        result = session.process.send_input(text)
+        self._send_json(result)
+
+    def _handle_workflow_status(self) -> None:
+        """워크플로우 세션 상태 조회 엔드포인트를 처리한다.
+
+        GET /terminal/workflow/status?session_id=wf-T-NNN-...
+
+        지정된 세션의 프로세스 상태와 메타데이터를 JSON으로 응답한다.
+        """
+        session_id = self._parse_query_param('session_id')
+        if not session_id:
+            self._send_error(400, 'Missing "session_id" query parameter')
+            return
+
+        session = workflow_registry.get(session_id)
+        if session is None:
+            self._send_error(404, f'Session not found: {session_id}')
+            return
+
+        self._send_json({
+            'session_id': session.session_id,
+            'ticket_id': session.ticket_id,
+            'command': session.command,
+            'work_dir': session.work_dir,
+            'status': session.process.status,
+            'created_at': session.created_at,
+            'clients': session.channel.client_count,
+            'current_step': session.current_step,
+            'last_artifact': session.last_artifact,
+        })
+
+    def _handle_workflow_sse(self) -> None:
+        """워크플로우 세션 전용 SSE 엔드포인트를 처리한다.
+
+        GET /terminal/workflow/events?session_id=wf-T-NNN-...
+
+        지정된 세션의 TerminalSSEChannel로부터 Claude CLI stdout 이벤트를
+        클라이언트에 스트리밍한다. 기존 /terminal/events SSE와 동일한 패턴을 사용하되,
+        세션별 독립 채널을 통해 멀티플렉싱한다.
+        """
+        session_id = self._parse_query_param('session_id')
+        if not session_id:
+            self._send_error(400, 'Missing "session_id" query parameter')
+            return
+
+        session = workflow_registry.get(session_id)
+        if session is None:
+            self._send_error(404, f'Session not found: {session_id}')
+            return
+
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Connection', 'keep-alive')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+
+        # 연결 확인용 초기 주석 전송
+        try:
+            self.wfile.write(b': connected\n\n')
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+
+        # 재접속 시 Last-Event-ID로 중복 재생 방지
+        last_event_id = _parse_last_event_id(self.headers)
+        session.channel.add(self.wfile, last_event_id=last_event_id)
+        try:
+            while True:
+                time.sleep(1)
+                try:
+                    self.wfile.write(b': heartbeat\n\n')
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    break
+        finally:
+            session.channel.remove(self.wfile)
+
+    def _handle_workflow_list(self) -> None:
+        """워크플로우 세션 목록 조회 엔드포인트를 처리한다.
+
+        GET /terminal/workflow/list
+
+        현재 레지스트리에 등록된 모든 워크플로우 세션의 메타데이터를
+        JSON 배열로 응답한다.
+        """
+        self._send_json(workflow_registry.list_all())
+
+    def _handle_workflow_artifact(self, qs: dict) -> None:
+        """워크플로우 산출물 파일 조회 엔드포인트를 처리한다.
+
+        GET /api/workflow/artifact?session_id=wf-*&path=plan.md
+
+        세션의 work_dir 하위 화이트리스트 파일만 plain text로 반환한다.
+        화이트리스트: plan.md, report.md, work/*.md, skill-mapping.md
+
+        경로 traversal 방지:
+        - ``..`` 포함 경로 즉시 차단
+        - ``os.path.realpath`` 정규화 후 work_dir prefix 검증
+        - 화이트리스트 패턴 불일치 시 403 반환
+
+        응답 헤더: Content-Type: text/markdown; charset=utf-8
+
+        Args:
+            qs: parse_qs 결과 dict (URL 쿼리 파라미터)
+
+        Returns:
+            None (응답 전송 후 종료)
+        """
+        import re as _re
+
+        session_id_list = qs.get('session_id')
+        path_list = qs.get('path')
+
+        if not session_id_list or not path_list:
+            self._send_error(404, 'Missing "session_id" or "path" query parameter')
+            return
+
+        session_id = session_id_list[0]
+        rel_path = path_list[0]
+
+        # 경로 traversal 조기 차단: '..' 포함 즉시 거부
+        if '..' in rel_path:
+            self._send_error(403, 'Path traversal detected')
+            return
+
+        # 세션 조회
+        session = workflow_registry.get(session_id)
+        if session is None:
+            self._send_error(404, f'Session not found: {session_id}')
+            return
+
+        # work_dir 미설정 검증
+        work_dir = session.work_dir
+        if not work_dir:
+            self._send_error(404, 'Session work_dir is not set')
+            return
+
+        # 화이트리스트 패턴 검증
+        _WHITELIST_PATTERNS = [
+            _re.compile(r'^plan\.md$'),
+            _re.compile(r'^report\.md$'),
+            _re.compile(r'^skill-mapping\.md$'),
+            _re.compile(r'^work/[^/]+\.md$'),
+        ]
+        if not any(p.match(rel_path) for p in _WHITELIST_PATTERNS):
+            self._send_error(403, f'Path not in whitelist: {rel_path}')
+            return
+
+        # work_dir realpath 정규화
+        try:
+            real_work_dir = os.path.realpath(work_dir)
+        except (OSError, ValueError):
+            self._send_error(404, 'Invalid work_dir')
+            return
+
+        # 파일 절대 경로 구성 + realpath 정규화
+        candidate = os.path.join(real_work_dir, rel_path)
+        try:
+            real_candidate = os.path.realpath(candidate)
+        except (OSError, ValueError):
+            self._send_error(403, 'Invalid file path')
+            return
+
+        # work_dir prefix 검증 (symlink 우회 방지)
+        if not real_candidate.startswith(real_work_dir + os.sep) and real_candidate != real_work_dir:
+            self._send_error(403, 'Path escapes work_dir boundary')
+            return
+
+        # 파일 읽기
+        if not os.path.isfile(real_candidate):
+            self._send_error(404, f'File not found: {rel_path}')
+            return
+
+        try:
+            with open(real_candidate, encoding='utf-8') as f:
+                content = f.read()
+        except OSError as exc:
+            self._send_error(404, f'Cannot read file: {exc}')
+            return
+
+        body = content.encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/markdown; charset=utf-8')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _send_error(self, code: int, message: str) -> None:
         """에러 응답을 JSON 형식으로 전송한다.
@@ -1458,15 +2228,24 @@ def _run_server(project_root: str) -> None:
     port = resolve_port(project_root)
 
     url_file = os.path.join(project_root, '.claude.workflow', '.board.url')
-    terminal_url_file = os.path.join(project_root, '.claude.workflow', '.terminal.url')
+
+    # 워크플로우 세션 persist 디렉터리 설정 + 디스크에서 복원
+    sessions_dir = os.path.join(project_root, '.claude.workflow', '.sessions')
+    workflow_registry._persist_dir = sessions_dir
+    try:
+        os.makedirs(sessions_dir, exist_ok=True)
+    except OSError:
+        pass
+    loaded_count = workflow_registry.load_from_disk()
+    if loaded_count > 0:
+        print(f'[workflow_registry] {loaded_count}개 세션 복원 완료', file=sys.stderr)
 
     def _cleanup_runtime_files() -> None:
-        """런타임 파일 .claude.workflow/.board.url, .terminal.url을 삭제한다."""
-        for f in (url_file, terminal_url_file):
-            try:
-                os.remove(f)
-            except OSError:
-                pass
+        """런타임 파일 .claude.workflow/.board.url을 삭제한다."""
+        try:
+            os.remove(url_file)
+        except OSError:
+            pass
 
     def _signal_handler(signum: int, frame: object) -> None:
         """SIGTERM/SIGINT 수신 시 Claude 프로세스와 런타임 파일을 정리하고 종료한다."""
@@ -1483,13 +2262,11 @@ def _run_server(project_root: str) -> None:
     base = f'http://127.0.0.1:{port}/.claude.workflow/board'
     with open(url_file, 'w') as f:
         f.write(f'{base}/index.html\n{base}/terminal.html')
-    with open(terminal_url_file, 'w') as f:
-        f.write(f'{base}/terminal.html')
 
     # FileWatcher 시작
     def on_change(event_type: str, files: list[str]) -> None:
         """파일 변경 감지 콜백."""
-        sse_manager.broadcast(event_type)
+        sse_manager.broadcast(event_type, files)
         poll_tracker.add(event_type, files)
 
     watcher = FileWatcher(project_root, on_change)
