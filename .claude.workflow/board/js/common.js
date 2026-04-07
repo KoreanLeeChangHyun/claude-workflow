@@ -73,10 +73,29 @@ function formatTime(dt) {
   return dt ? dt.substring(0, 16) : "";
 }
 
-/** Renders a colored badge span. */
-function badge(text, colors) {
+/** Command name → 3-letter abbreviation map. */
+var CMD_ABBR = {
+  implement: "IMP",
+  research: "RSC",
+  review: "REV",
+  prompt: "PRM",
+  refactor: "REF",
+  test: "TST",
+  deploy: "DEP",
+  design: "DES",
+  plan: "PLN",
+  fix: "FIX",
+  debug: "DBG",
+  analyze: "ANL",
+  document: "DOC",
+};
+Board.util.CMD_ABBR = CMD_ABBR;
+
+/** Renders a colored badge span with 3-letter abbreviation. */
+function badge(text, colors, extraStyle) {
   if (!text || !colors) return "";
-  return '<span class="badge" style="background:' + colors.bg + ";color:" + colors.fg + '">' + esc(text) + "</span>";
+  var label = CMD_ABBR[text] || text.substring(0, 3).toUpperCase();
+  return '<span class="badge" style="background:' + colors.bg + ";color:" + colors.fg + ";" + (extraStyle || '') + '">' + label + "</span>";
 }
 
 Board.util.esc = esc;
@@ -571,6 +590,8 @@ function switchTab(target, skipPush) {
   tabs.forEach(function (t) { t.classList.toggle("active", t.dataset.view === target); });
   views.forEach(function (v) { v.classList.toggle("active", v.id === "view-" + target); });
   if (target === "dashboard" && Board.render.renderDashboard) Board.render.renderDashboard();
+  if (target === "memory" && Board.render.renderMemory) Board.render.renderMemory();
+  if (target === "roadmap" && Board.render.renderRoadmap) Board.render.renderRoadmap();
   saveUI();
   if (Board.util.updateQueryString) Board.util.updateQueryString();
 }

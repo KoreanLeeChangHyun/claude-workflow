@@ -28,6 +28,29 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
+from board_data import (
+    KANBAN_DIRS_LIST,
+    WF_BASE,
+    WF_HISTORY,
+    DASH_BASE,
+    DASH_FILES,
+    WF_ENTRY_RE,
+    WF_DETAIL_FILES,
+    _resolve_settings_file,
+    _parse_env_file,
+    _update_env_value,
+    _read_kanban_tickets,
+    _read_dashboard,
+    _list_workflow_entries,
+    _get_git_branch,
+    _workflow_detail,
+    _resolve_memory_dir,
+    _list_memory_files,
+    _read_memory_file,
+    _write_memory_file,
+    _delete_memory_file,
+)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -340,6 +363,7 @@ class TerminalSSEChannel:
     Attributes:
         _clients: 연결된 클라이언트의 wfile 객체 목록
         _lock: 클라이언트 목록 접근용 Lock
+        _client_locks: wfile별 per-client Lock 딕셔너리
         _history: 최근 SSE 이벤트 링 버퍼 (재접속 시 재생용)
     """
 
@@ -352,6 +376,7 @@ class TerminalSSEChannel:
         """
         self._clients: list = []
         self._lock: threading.Lock = threading.Lock()
+        self._client_locks: dict = {}
         # 이벤트를 (seq_id, encoded) 튜플로 저장해 Last-Event-ID 기반 재개 지원
         self._history: collections.deque = collections.deque(maxlen=history_size)
         self._next_seq: int = 0
@@ -367,14 +392,17 @@ class TerminalSSEChannel:
         """
         with self._lock:
             self._clients.append(wfile)
-            for seq_id, encoded in list(self._history):
-                if seq_id <= last_event_id:
-                    continue  # 이미 수신한 이벤트는 건너뜀
-                try:
-                    wfile.write(encoded)
-                    wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    break
+            client_lock = threading.Lock()
+            self._client_locks[id(wfile)] = client_lock
+            with client_lock:
+                for seq_id, encoded in list(self._history):
+                    if seq_id <= last_event_id:
+                        continue  # 이미 수신한 이벤트는 건너뜀
+                    try:
+                        wfile.write(encoded)
+                        wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        break
 
     def clear_history(self) -> None:
         """히스토리 버퍼를 비운다. 새 세션 시작 시 이전 이벤트를 제거하기 위함."""
@@ -410,6 +438,19 @@ class TerminalSSEChannel:
                 self._clients.remove(wfile)
             except ValueError:
                 pass
+            self._client_locks.pop(id(wfile), None)
+
+    def get_lock(self, wfile: object) -> threading.Lock | None:
+        """wfile에 대응하는 per-client lock을 반환한다.
+
+        Args:
+            wfile: lock을 획득할 클라이언트의 wfile
+
+        Returns:
+            해당 wfile의 Lock. 클라이언트가 존재하지 않으면 None.
+        """
+        with self._lock:
+            return self._client_locks.get(id(wfile))
 
     def broadcast(self, data: dict) -> None:
         """NDJSON 메시지를 SSE 이벤트로 변환하여 모든 클라이언트에 전송한다.
@@ -440,18 +481,27 @@ class TerminalSSEChannel:
             encoded = message.encode('utf-8')
             # 링 버퍼에 (seq_id, encoded) 튜플로 저장
             self._history.append((seq_id, encoded))
-            for wfile in self._clients:
-                try:
+            clients_snapshot = list(self._clients)
+
+        for wfile in clients_snapshot:
+            client_lock = self._client_locks.get(id(wfile))
+            if client_lock is None:
+                continue
+            try:
+                with client_lock:
                     wfile.write(encoded)
                     wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    dead_clients.append(wfile)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                dead_clients.append(wfile)
 
-            for wfile in dead_clients:
-                try:
-                    self._clients.remove(wfile)
-                except ValueError:
-                    pass
+        if dead_clients:
+            with self._lock:
+                for wfile in dead_clients:
+                    try:
+                        self._clients.remove(wfile)
+                    except ValueError:
+                        pass
+                    self._client_locks.pop(id(wfile), None)
 
         # 파일 persist (서버 재시작 시 복원용) - 별도 락 사용
         if self._persist_path is not None:
@@ -502,8 +552,12 @@ class TerminalSSEChannel:
         if event_name == 'system':
             return self._build_system_payload(data)
         if event_name == 'permission':
+            req = data.get('request', {})
             return {
                 'kind': 'permission',
+                'request_id': data.get('request_id', ''),
+                'tool_name': req.get('tool_name', ''),
+                'description': req.get('description', ''),
                 'raw': data,
             }
         if event_name == 'error':
@@ -545,11 +599,20 @@ class TerminalSSEChannel:
                     'kind': 'input_json_delta',
                     'chunk': delta.get('partial_json', ''),
                 }
-            # content_block_start, message_start 등 기타 stream_event
-            return {
+            # content_block_start, message_start, message_delta 등 기타 stream_event
+            payload = {
                 'kind': event.get('type', 'stream_event'),
                 'raw': event,
             }
+            if 'usage' in event:
+                event_usage = event['usage']
+                payload['usage'] = {
+                    'input_tokens': (event_usage.get('input_tokens', 0)
+                        + event_usage.get('cache_read_input_tokens', 0)
+                        + event_usage.get('cache_creation_input_tokens', 0)),
+                    'output_tokens': event_usage.get('output_tokens', 0),
+                }
+            return payload
 
         if msg_type == 'assistant':
             content = data.get('message', {}).get('content', [])
@@ -558,10 +621,19 @@ class TerminalSSEChannel:
                 for block in content
                 if block.get('type') == 'text'
             ]
-            return {
+            payload = {
                 'kind': 'assistant',
                 'text': ''.join(text_parts),
             }
+            usage = data.get('message', {}).get('usage', {})
+            if usage:
+                payload['usage'] = {
+                    'input_tokens': (usage.get('input_tokens', 0)
+                        + usage.get('cache_read_input_tokens', 0)
+                        + usage.get('cache_creation_input_tokens', 0)),
+                    'output_tokens': usage.get('output_tokens', 0),
+                }
+            return payload
 
         return {'kind': msg_type or 'unknown', 'raw': data}
 
@@ -611,6 +683,46 @@ class TerminalSSEChannel:
         """현재 연결된 클라이언트 수를 반환한다."""
         with self._lock:
             return len(self._clients)
+
+
+# ---------------------------------------------------------------------------
+# Image Validation Helper
+# ---------------------------------------------------------------------------
+
+_ALLOWED_MEDIA_TYPES = {'image/png', 'image/jpeg', 'image/gif', 'image/webp'}
+
+
+def _validate_images(images: list) -> str | None:
+    """이미지 목록의 유효성을 검증한다.
+
+    각 항목에 data(문자열)와 허용된 media_type이 존재하는지 확인한다.
+
+    Args:
+        images: 검증할 이미지 항목 목록.
+
+    Returns:
+        유효하지 않을 때 에러 메시지 문자열, 유효하면 None.
+    """
+    if not isinstance(images, list):
+        return 'Invalid "images" field: must be a list'
+
+    for i, img in enumerate(images):
+        if not isinstance(img, dict):
+            return f'Invalid image at index {i}: must be an object'
+
+        data = img.get('data')
+        if not isinstance(data, str) or not data:
+            return f'Invalid image at index {i}: missing or invalid "data" field'
+
+        media_type = img.get('media_type')
+        if media_type not in _ALLOWED_MEDIA_TYPES:
+            allowed = ', '.join(sorted(_ALLOWED_MEDIA_TYPES))
+            return (
+                f'Invalid image at index {i}: '
+                f'"media_type" must be one of [{allowed}], got "{media_type}"'
+            )
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -675,10 +787,11 @@ class ClaudeProcess:
         if self._stdout_thread and self._stdout_thread.is_alive():
             self._stdout_thread.join(timeout=3)
 
-        # stdin 대기 모드로 시작: --print와 -p '' 제거
-        # --input-format stream-json만 사용하면 Claude는 stdin에서 NDJSON 입력을 대기한다
+        # -p(print mode)로 시작: --input-format stream-json은 print mode 전용
+        # 이미지 content block이 정상 전달되려면 -p 플래그가 반드시 필요하다
         cmd = [
             'claude',
+            '-p',
             '--output-format', 'stream-json',
             '--input-format', 'stream-json',
             '--include-partial-messages',
@@ -701,6 +814,7 @@ class ClaudeProcess:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding='utf-8',
                 bufsize=1,
                 env=proc_env,
             )
@@ -738,23 +852,51 @@ class ClaudeProcess:
             'error': '',
         }
 
-    def send_input(self, text: str) -> dict:
+    def send_input(self, text: str, images: list[dict] | None = None) -> dict:
         """사용자 메시지를 Claude CLI stdin에 NDJSON 엔벨로프로 전송한다.
 
         Args:
             text: 전송할 사용자 메시지 텍스트
+            images: 첨부 이미지 목록. 각 항목은 {"data": str, "media_type": str} 형태.
+                    None이면 텍스트 전용 content 문자열로 구성한다.
 
         Returns:
             전송 결과 dict: {"ok": True/False, "error": str}
         """
         if not self._process or self._process.poll() is not None:
-            return {'ok': False, 'error': 'process not running'}
+            # -p 모드에서 result 후 프로세스가 종료된 경우 --resume으로 자동 재시작
+            if self._session_id:
+                resume_args = ['--resume', self._session_id]
+                self._init_event.clear()
+                result = self.spawn(extra_args=resume_args)
+                if not result.get('ok'):
+                    return {'ok': False, 'error': f'respawn failed: {result.get("error", "")}'}
+                # init 이벤트가 완료될 때까지 최대 10초 대기
+                if not self._init_event.wait(timeout=10):
+                    return {'ok': False, 'error': 'respawn init timeout'}
+            else:
+                return {'ok': False, 'error': 'process not running'}
+
+        if images is not None:
+            content: str | list = [{'type': 'text', 'text': text}] + [
+                {
+                    'type': 'image',
+                    'source': {
+                        'type': 'base64',
+                        'media_type': img['media_type'],
+                        'data': img['data'],
+                    },
+                }
+                for img in images
+            ]
+        else:
+            content = text
 
         envelope = {
             'type': 'user',
             'message': {
                 'role': 'user',
-                'content': text,
+                'content': content,
             },
         }
         if self._session_id:
@@ -769,6 +911,83 @@ class ClaudeProcess:
             except (BrokenPipeError, OSError) as e:
                 self._status = 'stopped'
                 return {'ok': False, 'error': str(e)}
+
+        return {'ok': True, 'error': ''}
+
+    def send_permission_response(
+        self,
+        request_id: str,
+        decision: str,
+        session_id: str | None = None,
+    ) -> dict:
+        """permission 요청에 대한 control_response NDJSON을 stdin으로 전송한다.
+
+        Args:
+            request_id: 응답할 control_request의 request_id
+            decision: "allow" 또는 "deny"
+            session_id: 워크플로우 세션 ID (선택적). 지정 시 최상위 session_id 필드 추가.
+
+        Returns:
+            전송 결과 dict: {"ok": True/False, "error": str}
+        """
+        if not self._process or self._process.poll() is not None:
+            return {'ok': False, 'error': 'process not running'}
+
+        if decision == 'allow':
+            response_body = {
+                'subtype': 'success',
+                'request_id': request_id,
+                'response': {},
+            }
+        else:
+            response_body = {
+                'subtype': 'error',
+                'request_id': request_id,
+                'error': 'User denied permission',
+            }
+
+        envelope: dict = {
+            'type': 'control_response',
+            'response': response_body,
+        }
+        if session_id:
+            envelope['session_id'] = session_id
+
+        ndjson_line = json.dumps(envelope, ensure_ascii=False) + '\n'
+
+        with self._stdin_lock:
+            try:
+                self._process.stdin.write(ndjson_line)
+                self._process.stdin.flush()
+            except (BrokenPipeError, OSError) as e:
+                self._status = 'stopped'
+                return {'ok': False, 'error': str(e)}
+
+        return {'ok': True, 'error': ''}
+
+    def interrupt(self) -> dict:
+        """Claude CLI 프로세스에 SIGINT를 전송하여 현재 응답 생성만 중단한다.
+
+        kill()과 달리 프로세스를 종료하지 않는다. SIGINT를 수신한 Claude CLI는
+        현재 응답 생성을 중단하고 새 입력 대기 상태(idle)로 복귀한다.
+        _status는 변경하지 않는다 — Claude CLI가 result 이벤트를 발행하면
+        _read_stdout_loop에서 idle로 전환된다.
+
+        Returns:
+            결과 dict: {"ok": True/False, "error": str}
+        """
+        if not self._process:
+            return {'ok': False, 'error': 'process not running'}
+
+        if self._process.poll() is not None:
+            self._status = 'stopped'
+            self._process = None
+            return {'ok': False, 'error': 'process not running'}
+
+        try:
+            os.kill(self._process.pid, signal.SIGINT)
+        except OSError as e:
+            return {'ok': False, 'error': str(e)}
 
         return {'ok': True, 'error': ''}
 
@@ -873,7 +1092,13 @@ class ClaudeProcess:
             # 프로세스가 종료된 경우 상태 업데이트
             if proc.poll() is not None:
                 exit_code = proc.returncode
-                self._status = 'stopped'
+                # -p 모드에서 result 완료 후 정상 종료(exit_code 0)는
+                # idle 상태로 전환하여 즉시 재입력 가능하게 한다.
+                # 비정상 종료(exit_code != 0)만 stopped로 설정한다.
+                if exit_code == 0:
+                    self._status = 'idle'
+                else:
+                    self._status = 'stopped'
                 # 종료 이벤트를 SSE로 알림
                 self._channel.broadcast({
                     'type': 'system',
@@ -1221,289 +1446,6 @@ class WorkflowSessionRegistry:
 workflow_registry: WorkflowSessionRegistry = WorkflowSessionRegistry()
 
 
-KANBAN_DIRS_LIST: list[str] = ['open', 'progress', 'review', 'done']
-WF_BASE: str = os.path.join('.claude.workflow', 'workflow')
-WF_HISTORY: str = os.path.join('.claude.workflow', 'workflow', '.history')
-DASH_BASE: str = os.path.join('.claude.workflow', 'dashboard')
-DASH_FILES: list[str] = ['usage', 'logs', 'skills']
-WF_ENTRY_RE = __import__('re').compile(r'^\d{8}-\d{6}$')
-WF_DETAIL_FILES: list[dict] = [
-    {'key': 'query',   'file': 'user_prompt.txt'},
-    {'key': 'plan',    'file': 'plan.md'},
-    {'key': 'report',  'file': 'report.md'},
-    {'key': 'summary', 'file': 'summary.txt'},
-    {'key': 'usage',   'file': 'usage.json'},
-    {'key': 'log',     'file': 'workflow.log'},
-]
-
-
-def _resolve_settings_file(project_root: str) -> str:
-    """Return .settings if exists, else .env (fallback)."""
-    settings = os.path.join(project_root, '.claude.workflow', '.settings')
-    if os.path.exists(settings):
-        return settings
-    return os.path.join(project_root, '.claude.workflow', '.env')
-
-
-def _parse_env_file(project_root: str) -> list[dict]:
-    """Parse .settings/.env into structured sections for the settings UI."""
-    env_file = _resolve_settings_file(project_root)
-    if not os.path.exists(env_file):
-        return []
-
-    sections: dict[str, list[dict]] = {}
-    section_order: list[str] = []
-    current_section = '기타'
-    pending_comment = ''
-
-    with open(env_file, encoding='utf-8') as f:
-        for line in f:
-            stripped = line.strip()
-
-            # Section header: "# (N) Section Name"
-            if stripped.startswith('# (') and ')' in stripped:
-                current_section = stripped.split(')', 1)[1].strip()
-                if current_section not in sections:
-                    sections[current_section] = []
-                    section_order.append(current_section)
-                pending_comment = ''
-                continue
-
-            if stripped.startswith('# ---'):
-                continue
-
-            if stripped.startswith('#'):
-                text = stripped[1:].strip()
-                if text.startswith('용도:'):
-                    pending_comment = text[3:].strip()
-                continue
-
-            if not stripped or '=' not in stripped:
-                continue
-
-            key, _, rest = stripped.partition('=')
-            key = key.strip()
-
-            # Extract inline comment (2+ spaces before #)
-            value = rest
-            inline_comment = ''
-            m = __import__('re').match(r'^(.*?)\s{2,}#\s*(.*)', rest)
-            if m:
-                value = m.group(1).strip()
-                inline_comment = m.group(2).strip()
-            else:
-                value = rest.strip()
-
-            # Detect type
-            var_type = 'string'
-            if value.lower() in ('true', 'false'):
-                var_type = 'bool'
-            elif value.isdigit():
-                var_type = 'int'
-            else:
-                try:
-                    float(value)
-                    if '.' in value:
-                        var_type = 'float'
-                except ValueError:
-                    pass
-
-            label = inline_comment or pending_comment or ''
-            if current_section not in sections:
-                sections[current_section] = []
-                section_order.append(current_section)
-
-            sections[current_section].append({
-                'key': key,
-                'value': value,
-                'type': var_type,
-                'label': label,
-            })
-            pending_comment = ''
-
-    return [{'section': s, 'vars': sections[s]} for s in section_order]
-
-
-def _update_env_value(project_root: str, key: str, new_value: str) -> bool:
-    """Update a single key's value in .settings/.env, preserving structure and comments."""
-    env_file = _resolve_settings_file(project_root)
-    if not os.path.exists(env_file):
-        return False
-
-    with open(env_file, encoding='utf-8') as f:
-        lines = f.readlines()
-
-    _re = __import__('re')
-    pattern = _re.compile(r'^' + _re.escape(key) + r'=')
-
-    for i, line in enumerate(lines):
-        if not pattern.match(line.strip()):
-            continue
-
-        old_rest = line.strip().split('=', 1)[1]
-        inline_part = ''
-        m = _re.match(r'^(.*?)\s{2,}(#\s*.*)', old_rest)
-        if m:
-            inline_part = m.group(2)
-
-        if inline_part:
-            base = f"{key}={new_value}"
-            pad = max(2, 40 - len(base))
-            lines[i] = base + ' ' * pad + inline_part + '\n'
-        else:
-            lines[i] = f"{key}={new_value}\n"
-        break
-    else:
-        return False
-
-    with open(env_file, 'w', encoding='utf-8') as f:
-        f.writelines(lines)
-    return True
-
-
-def _read_kanban_tickets(
-    project_root: str, files: list[str] | None = None,
-) -> dict[str, str | None]:
-    """kanban 디렉터리에서 XML 티켓을 읽어 {파일명: 내용} dict를 반환한다."""
-    kanban = os.path.join(project_root, '.claude.workflow', 'kanban')
-    result: dict[str, str | None] = {}
-    for d in KANBAN_DIRS_LIST:
-        dp = os.path.join(kanban, d)
-        if not os.path.isdir(dp):
-            continue
-        try:
-            for e in os.scandir(dp):
-                if not e.is_file() or not e.name.endswith('.xml'):
-                    continue
-                if files and e.name not in files:
-                    continue
-                if e.name in result:
-                    continue
-                try:
-                    with open(e.path, encoding='utf-8') as f:
-                        result[e.name] = f.read()
-                except OSError:
-                    result[e.name] = None
-        except OSError:
-            pass
-    if files:
-        for fn in files:
-            if fn not in result:
-                result[fn] = None
-    return result
-
-
-def _read_dashboard(project_root: str) -> dict[str, str]:
-    """dashboard .md 파일 3개를 읽어 반환한다."""
-    base = os.path.join(project_root, DASH_BASE)
-    result: dict[str, str] = {}
-    for name in DASH_FILES:
-        path = os.path.join(base, f'.{name}.md')
-        try:
-            with open(path, encoding='utf-8') as f:
-                result[name] = f.read()
-        except OSError:
-            result[name] = ''
-    return result
-
-
-def _list_workflow_entries(project_root: str) -> list[str]:
-    """workflow + .history 엔트리를 최신순 정렬하여 반환한다."""
-    entries: list[str] = []
-    for rel in (WF_BASE, WF_HISTORY):
-        abs_dir = os.path.join(project_root, rel)
-        if not os.path.isdir(abs_dir):
-            continue
-        prefix = rel + '/'
-        try:
-            for e in os.scandir(abs_dir):
-                if e.is_dir() and WF_ENTRY_RE.match(e.name):
-                    entries.append(prefix + e.name + '/')
-        except OSError:
-            pass
-    entries.sort(key=lambda p: p.rstrip('/').rsplit('/', 1)[-1], reverse=True)
-    return entries
-
-
-def _get_git_branch(project_root: str) -> str:
-    """현재 git 브랜치명을 반환한다.
-
-    git 명령 실행 실패 또는 타임아웃 시 빈 문자열을 반환한다.
-    """
-    try:
-        result = subprocess.run(
-            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
-            capture_output=True, text=True, timeout=3,
-            cwd=project_root,
-        )
-        return result.stdout.strip() if result.returncode == 0 else ''
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return ''
-
-
-def _workflow_detail(project_root: str, entry_rel: str) -> list[dict]:
-    """워크플로우 엔트리 1개의 상세 정보를 반환한다."""
-    entry_name = entry_rel.rstrip('/').rsplit('/', 1)[-1]
-    entry_abs = os.path.join(project_root, entry_rel.strip('/'))
-    if not os.path.isdir(entry_abs):
-        return []
-    items: list[dict] = []
-    try:
-        task_dirs = sorted(
-            (e.name for e in os.scandir(entry_abs) if e.is_dir()),
-        )
-    except OSError:
-        return []
-    for task in task_dirs:
-        task_abs = os.path.join(entry_abs, task)
-        try:
-            cmd_dirs = sorted(
-                (e.name for e in os.scandir(task_abs) if e.is_dir()),
-            )
-        except OSError:
-            continue
-        for cmd in cmd_dirs:
-            cmd_abs = os.path.join(task_abs, cmd)
-            status_path = os.path.join(cmd_abs, 'status.json')
-            if not os.path.isfile(status_path):
-                continue
-            try:
-                with open(status_path, encoding='utf-8') as f:
-                    status = json.load(f)
-            except (OSError, json.JSONDecodeError):
-                continue
-            # basePath: relative URL matching client convention
-            base_path = entry_rel + task + '/' + cmd + '/'
-            # file map
-            file_map: dict = {}
-            for wf in WF_DETAIL_FILES:
-                fp = os.path.join(cmd_abs, wf['file'])
-                exists = os.path.isfile(fp)
-                file_map[wf['key']] = {
-                    'exists': exists,
-                    'url': base_path + wf['file'] if exists else '',
-                }
-            work_dir = os.path.join(cmd_abs, 'work')
-            has_work = os.path.isdir(work_dir)
-            file_map['work'] = {
-                'exists': has_work,
-                'url': base_path + 'work/' if has_work else '',
-                'isDir': True,
-            }
-            items.append({
-                'entry': entry_name,
-                'task': task,
-                'command': cmd,
-                'basePath': base_path,
-                'step': status.get('step', 'NONE'),
-                'created_at': status.get('created_at', ''),
-                'updated_at': status.get('updated_at', ''),
-                'transitions': status.get('transitions', []),
-                'fileMap': file_map,
-            })
-    return items
-
-
 class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
     """Board 전용 HTTP 요청 핸들러.
 
@@ -1551,6 +1493,8 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
             self._handle_terminal_start()
         elif self.path == '/terminal/input':
             self._handle_terminal_input()
+        elif self.path == '/terminal/interrupt':
+            self._handle_terminal_interrupt()
         elif self.path == '/terminal/kill':
             self._handle_terminal_kill()
         elif self.path == '/terminal/workflow/start':
@@ -1559,9 +1503,68 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
             self._handle_workflow_kill()
         elif self.path == '/terminal/workflow/input':
             self._handle_workflow_input()
+        elif self.path == '/terminal/command':
+            self._handle_terminal_command()
+        elif self.path == '/terminal/permission':
+            self._handle_terminal_permission()
+        elif self.path == '/api/memory/file':
+            self._handle_memory_write()
         else:
             self.send_response(404)
             self.end_headers()
+
+    def do_DELETE(self) -> None:
+        """DELETE 요청을 처리한다."""
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(self.path)
+        path = parsed.path
+        qs = parse_qs(parsed.query)
+
+        if path == '/api/memory/file':
+            name = qs.get('name', [None])[0]
+            if not name:
+                self._send_error(400, 'Missing "name" query parameter')
+                return
+            try:
+                self._send_json(
+                    _delete_memory_file(os.getcwd(), name),
+                )
+            except ValueError as e:
+                self._send_error(400, str(e))
+            except FileNotFoundError as e:
+                self._send_error(404, str(e))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _handle_memory_write(self) -> None:
+        """메모리 파일 생성/수정 엔드포인트를 처리한다.
+
+        POST /api/memory/file: 요청 본문 {"name": "filename.md", "content": "..."}
+        """
+        content_length = int(self.headers.get('Content-Length', 0))
+        if content_length == 0:
+            self._send_error(400, 'Empty request body')
+            return
+
+        body = self.rfile.read(content_length)
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            self._send_error(400, 'Invalid JSON')
+            return
+
+        name = data.get('name', '')
+        content = data.get('content', '')
+        if not name:
+            self._send_error(400, 'Missing "name" field')
+            return
+
+        try:
+            result = _write_memory_file(os.getcwd(), name, content)
+            self._send_json(result)
+        except ValueError as e:
+            self._send_error(400, str(e))
 
     def _handle_restart(self) -> None:
         """서버 재시작 요청을 처리한다.
@@ -1628,6 +1631,19 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
             self._send_json({'branch': _get_git_branch(project_root)})
         elif path == '/api/workflow/artifact':
             self._handle_workflow_artifact(qs)
+        elif path == '/api/memory':
+            self._send_json(_list_memory_files(project_root))
+        elif path == '/api/memory/file':
+            name = qs.get('name', [None])[0]
+            if not name:
+                self._send_error(400, 'Missing "name" query parameter')
+                return
+            try:
+                self._send_json(_read_memory_file(project_root, name))
+            except ValueError as e:
+                self._send_error(400, str(e))
+            except FileNotFoundError as e:
+                self._send_error(404, str(e))
         else:
             self.send_response(404)
             self.end_headers()
@@ -1652,7 +1668,7 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
         연결을 유지하며 FileWatcher의 이벤트를 클라이언트에 스트리밍한다.
         """
         self.send_response(200)
-        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
         self.send_header('Cache-Control', 'no-cache')
         self.send_header('Connection', 'keep-alive')
         self.send_header('Access-Control-Allow-Origin', '*')
@@ -1693,7 +1709,7 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
         기존 /events SSE와 완전히 독립된 채널을 사용한다.
         """
         self.send_response(200)
-        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
         self.send_header('Cache-Control', 'no-cache')
         self.send_header('Connection', 'keep-alive')
         self.send_header('Access-Control-Allow-Origin', '*')
@@ -1712,9 +1728,13 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
         try:
             while True:
                 time.sleep(1)
+                client_lock = terminal_sse_channel.get_lock(self.wfile)
+                if client_lock is None:
+                    break
                 try:
-                    self.wfile.write(b': heartbeat\n\n')
-                    self.wfile.flush()
+                    with client_lock:
+                        self.wfile.write(b': heartbeat\n\n')
+                        self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     break
         finally:
@@ -1782,11 +1802,19 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
             return
 
         text = data.get('text', '')
-        if not text:
+        images = data.get('images', None)
+
+        if not text and not images:
             self._send_error(400, 'Missing "text" field')
             return
 
-        result = claude_process.send_input(text)
+        if images is not None:
+            validation_error = _validate_images(images)
+            if validation_error:
+                self._send_error(400, validation_error)
+                return
+
+        result = claude_process.send_input(text, images=images)
         self._send_json(result)
 
     def _handle_terminal_kill(self) -> None:
@@ -1801,6 +1829,104 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
             return
 
         result = claude_process.kill()
+        self._send_json(result)
+
+    def _handle_terminal_command(self) -> None:
+        """슬래시 명령어 전달 엔드포인트를 처리한다.
+
+        POST /terminal/command: 클라이언트에서 전송한 슬래시 명령어를 Claude CLI stdin에
+        전달한다. 기존 send_input() 메서드를 재사용하여 NDJSON 엔벨로프로 전송한다.
+
+        요청 본문: {"command": "/clear"}
+        선택 필드: "session_id" (현재 미사용, 메인 세션 전용)
+
+        프로세스 미시작 시 409 Conflict를 반환한다.
+        """
+        if claude_process.status == 'stopped':
+            self._send_error(409, 'Claude process not running')
+            return
+
+        content_length = int(self.headers.get('Content-Length', 0))
+        if content_length == 0:
+            self._send_error(400, 'Empty request body')
+            return
+
+        body = self.rfile.read(content_length)
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            self._send_error(400, 'Invalid JSON')
+            return
+
+        command = data.get('command', '').strip()
+        if not command:
+            self._send_error(400, 'Missing "command" field')
+            return
+
+        if not command.startswith('/'):
+            self._send_error(400, 'Command must start with "/"')
+            return
+
+        result = claude_process.send_input(command)
+        self._send_json(result)
+
+    def _handle_terminal_permission(self) -> None:
+        """permission 요청에 대한 승인/거부 응답 엔드포인트를 처리한다.
+
+        POST /terminal/permission
+        요청 본문: {"request_id": "...", "decision": "allow"|"deny"}
+        선택 필드: "session_id" (워크플로우 세션용)
+
+        session_id가 있으면 workflow_registry에서 해당 세션의 프로세스를 사용하고,
+        없으면 claude_process(메인 터미널)를 사용한다.
+
+        프로세스 미실행 시 409 Conflict, 잘못된 요청 시 400 Bad Request를 반환한다.
+        """
+        data = self._read_json_body()
+        if data is None:
+            return
+
+        request_id = data.get('request_id', '').strip()
+        if not request_id:
+            self._send_error(400, 'Missing "request_id" field')
+            return
+
+        decision = data.get('decision', '').strip()
+        if decision not in ('allow', 'deny'):
+            self._send_error(400, '"decision" must be "allow" or "deny"')
+            return
+
+        session_id = data.get('session_id', '').strip() or None
+
+        if session_id:
+            session = workflow_registry.get(session_id)
+            if session is None:
+                self._send_error(404, f'Session not found: {session_id}')
+                return
+            process = session.process
+        else:
+            process = claude_process
+
+        if process.status == 'stopped':
+            self._send_error(409, 'Claude process not running')
+            return
+
+        result = process.send_permission_response(request_id, decision, session_id)
+        self._send_json(result)
+
+    def _handle_terminal_interrupt(self) -> None:
+        """현재 응답 생성 중단 엔드포인트를 처리한다.
+
+        POST /terminal/interrupt: Claude CLI 프로세스에 SIGINT를 전송한다.
+        프로세스를 종료하지 않고 현재 응답 생성만 중단한다.
+
+        프로세스가 stopped 상태이면 409 Conflict를 반환한다.
+        """
+        if claude_process.status == 'stopped':
+            self._send_error(409, 'Claude process not running')
+            return
+
+        result = claude_process.interrupt()
         self._send_json(result)
 
     # -- Workflow Session API handlers ----------------------------------------
@@ -1948,16 +2074,24 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
             return
 
         text = data.get('text', '')
-        if not text:
+        images = data.get('images', None)
+
+        if not text and not images:
             self._send_error(400, 'Missing "text" field')
             return
+
+        if images is not None:
+            validation_error = _validate_images(images)
+            if validation_error:
+                self._send_error(400, validation_error)
+                return
 
         session = workflow_registry.get(session_id)
         if session is None:
             self._send_error(404, f'Session not found: {session_id}')
             return
 
-        result = session.process.send_input(text)
+        result = session.process.send_input(text, images=images)
         self._send_json(result)
 
     def _handle_workflow_status(self) -> None:
@@ -2009,7 +2143,7 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
             return
 
         self.send_response(200)
-        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
         self.send_header('Cache-Control', 'no-cache')
         self.send_header('Connection', 'keep-alive')
         self.send_header('Access-Control-Allow-Origin', '*')
@@ -2028,9 +2162,13 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
         try:
             while True:
                 time.sleep(1)
+                client_lock = session.channel.get_lock(self.wfile)
+                if client_lock is None:
+                    break
                 try:
-                    self.wfile.write(b': heartbeat\n\n')
-                    self.wfile.flush()
+                    with client_lock:
+                        self.wfile.write(b': heartbeat\n\n')
+                        self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     break
         finally:
@@ -2170,7 +2308,7 @@ class BoardHTTPRequestHandler(SimpleHTTPRequestHandler):
         """CORS preflight 요청을 처리한다."""
         self.send_response(204)
         self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.send_header('Access-Control-Max-Age', '86400')
         self.end_headers()
@@ -2262,6 +2400,11 @@ def _run_server(project_root: str) -> None:
     base = f'http://127.0.0.1:{port}/.claude.workflow/board'
     with open(url_file, 'w') as f:
         f.write(f'{base}/index.html\n{base}/terminal.html')
+
+    # Memory 디렉터리를 WATCH_DIRS에 동적 등록 (절대경로 → os.path.join에서 그대로 사용됨)
+    mem_dir = _resolve_memory_dir(project_root)
+    if os.path.isdir(mem_dir):
+        WATCH_DIRS[mem_dir] = 'memory'
 
     # FileWatcher 시작
     def on_change(event_type: str, files: list[str]) -> None:
