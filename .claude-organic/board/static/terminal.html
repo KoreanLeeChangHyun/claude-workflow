@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Code Terminal</title>
+<link rel="stylesheet" href="css/core/common.css">
+<link rel="stylesheet" href="css/terminal/layout-and-message.css">
+<link rel="stylesheet" href="css/terminal/tool-box.css">
+<link rel="stylesheet" href="css/terminal/renderers.css">
+<link rel="stylesheet" href="css/terminal/workflow-panels.css">
+<link rel="stylesheet" href="css/vendor/highlight-github-dark.min.css">
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100vh;
+    overflow: hidden;
+    background: #1e1e1e;
+    color-scheme: dark;
+  }
+  #terminal-standalone {
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  #terminal-standalone .terminal-container {
+    height: 100vh;
+  }
+</style>
+</head>
+<body>
+
+<div id="terminal-standalone"></div>
+
+<script src="js/vendor/marked-15.0.0.min.js"></script>
+<script src="js/vendor/highlight-11.11.1.min.js"></script>
+<script>
+(function(){
+  if(typeof hljs==='undefined')return;
+  var langs=['javascript','typescript','python','bash','css','xml','json'];
+  var base='js/vendor/highlight-languages/';
+  var i=0;
+  function loadNext(){
+    if(i>=langs.length){hljs.configure({ignoreUnescapedHTML:true});return;}
+    var s=document.createElement('script');s.src=base+langs[i++]+'.min.js';
+    s.onload=loadNext;s.onerror=loadNext;document.head.appendChild(s);
+  }
+  loadNext();
+})();
+</script>
+<script src="js/core/common.js"></script>
+<script src="js/terminal/tool-renderers.js"></script>
+<script src="js/terminal/output-pipe.js"></script>
+<script src="js/terminal/tool-box.js"></script>
+<script src="js/terminal/terminal-input.js"></script>
+<script src="js/terminal/session-switcher.js"></script>
+<script src="js/workflow/workflow-bar.js"></script>
+<script src="js/core/slash-commands.js"></script>
+<script src="js/workflow/workflow-sessions.js"></script>
+<script src="js/terminal/wf-ticket-renderer.js"></script>
+<script src="js/workflow/session.js"></script>
+<script src="js/terminal/terminal.js"></script>
+<script>
+  // Standalone initialization — invoke renderTerminal immediately.
+  // Board namespace and state are already initialized by common.js.
+  // terminal.js detects standalone mode via absence of #view-terminal.
+  (function () {
+    if (Board.render && Board.render.renderTerminal) {
+      Board.render.renderTerminal();
+    }
+  })();
+</script>
+</body>
+</html>
