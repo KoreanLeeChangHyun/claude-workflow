@@ -20,8 +20,143 @@ Board.util = Board.util || {};
 Board.render = Board.render || {};
 Board.fetch = Board.fetch || {};
 
+// ── Debug Logger (server-gated) ──
+//
+// 계측은 코드 전체에 상시 심어두고, 서버 측 플래그 파일로 활성화를 결정한다.
+// Claude 가 .claude-organic/runs/bg/debug.enabled 파일을 touch/rm 하여 제어.
+// 클라는 항상 /api/debug-log 로 POST — 서버가 플래그 파일을 체크해 파일에
+// 쓸지 버릴지 결정한다. 평소 오버헤드는 fetch 한 번(수 ms) 만 발생.
+//
+// 진단 흐름:
+//   1. Claude: touch .../runs/bg/debug.enabled (+ 기존 로그 비우기)
+//   2. 사용자: 문제 재현
+//   3. Claude: cat .../runs/bg/debug.log 로 분석
+//   4. Claude: rm .../runs/bg/debug.enabled (비활성화)
+
+Board.debugLog = function (tag, data) {
+  var entry = {
+    ts: new Date().toISOString(),
+    tag: String(tag || ''),
+    data: data === undefined ? null : data,
+  };
+  try {
+    fetch('/api/debug-log', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(entry),
+      keepalive: true,
+    }).catch(function () {});
+  } catch (e) { /* 네트워크 에러 무시 */ }
+};
+
+// ── Terminal Status State Machine ──
+//
+// 메인 터미널 세션의 수명 주기를 표현하는 enum 과 전이 헬퍼.
+//
+//   stopped   : Claude CLI 프로세스 없음. Start 대기.
+//   starting  : spawn 요청부터 system/init 이벤트 수신 전까지. 입력 비활성.
+//   idle      : Claude 준비 완료. 응답 없음. 입력 가능.
+//   busy      : 사용자 입력 전송 후 result/process_exit 수신 전. 스피너 표시.
+//   archived  : 읽기 전용으로 복원된 과거 세션. 입력 불가.
+//   missing   : 서버가 세션을 못 찾음 (404). 입력 불가.
+//
+// 일반 수명 주기:
+//   stopped -> starting -> idle -> busy -> idle -> ... -> stopped
+//
+// 비정상/복원 경로:
+//   starting -> stopped      (spawn 실패)
+//   busy     -> stopped      (process_exit)
+//   *        -> archived     (archived 로드 시)
+//   *        -> missing      (fetchStatus 404)
+//
+// 라벨(UI 표시용):
+//   stopped=종료됨, starting=준비 중, idle=대기, busy=응답 중,
+//   archived=읽기 전용, missing=세션 없음
+//
+Board.util.TERM_STATUSES = Object.freeze({
+  STOPPED: 'stopped',
+  STARTING: 'starting',
+  IDLE: 'idle',
+  BUSY: 'busy',
+  ARCHIVED: 'archived',
+  MISSING: 'missing',
+});
+
+Board.util.TERM_STATUS_LABELS = Object.freeze({
+  stopped: 'Stopped',
+  starting: 'Starting',
+  idle: 'Idle',
+  busy: 'Busy',
+  archived: 'Archived',
+  missing: 'Missing',
+});
+
+/** Kill 버튼을 눌러 세션을 종료할 수 있는 상태 */
+Board.util.TERM_STATUS_KILLABLE = Object.freeze(
+  new Set(['starting', 'idle', 'busy'])
+);
+
+/** Claude 가 현재 작업 중(스피너 표시)인 상태 */
+Board.util.TERM_STATUS_SPINNING = Object.freeze(new Set(['busy']));
+
+/** 사용자가 새 입력을 보낼 수 있는 상태 */
+Board.util.TERM_STATUS_INPUTTABLE = Object.freeze(
+  new Set(['idle', 'busy'])
+);
+
+/** 서버(`/terminal/status`) 가 권위 있게 판단하는 상태 — 클라 확장 상태는 클라가 관리 */
+var _SERVER_AUTHORITATIVE = Object.freeze(new Set(['stopped']));
+var _CLIENT_EXTENDED = Object.freeze(
+  new Set(['starting', 'idle', 'busy', 'archived', 'missing'])
+);
+
+/**
+ * Sets Board.state.termStatus. 단일 진입점으로 써서 전이 규칙을 일관되게 유지한다.
+ * @param {string} next 새 상태 (TERM_STATUSES 값 중 하나)
+ */
+Board.state.setTermStatus = function (next) {
+  if (typeof next !== 'string') return;
+  Board.state.termStatus = next;
+};
+
+/**
+ * 서버 /terminal/status 응답(stopped/running)을 클라 상태 머신에 병합한다.
+ * - 서버가 stopped 를 반환하면 클라도 stopped 로 전이 (권위).
+ * - 서버가 running 을 반환하고 클라가 확장 상태(starting/idle/busy/archived/missing)에
+ *   있으면 클라 상태를 유지. 그 외엔 idle 로 간주.
+ * archived/missing 은 fetchStatus 404 또는 archived_end 등 별도 경로에서 진입하므로
+ * 여기서 직접 설정하지 않는다.
+ *
+ * @param {string} serverStatus 서버가 보고한 상태 문자열
+ */
+Board.state.reconcileTermStatus = function (serverStatus) {
+  var current = Board.state.termStatus;
+  var result;
+  if (!serverStatus) {
+    Board.state.setTermStatus('stopped');
+    result = 'stopped(empty)';
+  } else if (serverStatus === 'stopped') {
+    Board.state.setTermStatus('stopped');
+    result = 'stopped';
+  } else if (serverStatus === 'running') {
+    if (_CLIENT_EXTENDED.has(current)) {
+      result = 'keep(' + current + ')';
+    } else {
+      Board.state.setTermStatus('busy');
+      result = 'busy(from-' + current + ')';
+    }
+  } else {
+    Board.state.setTermStatus(serverStatus);
+    result = 'passthrough(' + serverStatus + ')';
+  }
+  if (Board.debugLog) Board.debugLog('reconcileTermStatus', {
+    server: serverStatus, before: current, after: Board.state.termStatus, result: result,
+  });
+};
+
 // ── Constants ──
 const COLUMNS = [
+  { key: "To Do", label: "To Do", dot: "dot-todo" },
   { key: "Open", label: "Open", dot: "dot-open" },
   { key: "In Progress", label: "In Progress", dot: "dot-progress" },
   { key: "Review", label: "Review", dot: "dot-review" },
@@ -36,6 +171,7 @@ const CMD_COLORS = {
 };
 
 const STATUS_COLORS = {
+  "To Do": { bg: "rgba(106,159,181,0.15)", fg: "#6a9fb5" },
   Open: { bg: "rgba(78,201,176,0.15)", fg: "#4ec9b0" },
   Submit: { bg: "rgba(86,156,214,0.15)", fg: "#569cd6" },
   "In Progress": { bg: "rgba(220,220,170,0.15)", fg: "#dcdcaa" },
@@ -419,23 +555,41 @@ function cleanupMermaidOrphans(id) {
 
 /** Renders pending Mermaid diagram blocks. */
 function initMermaid() {
-  const blocks = document.querySelectorAll(".mermaid-block");
+  var defined = typeof mermaid !== "undefined";
+  var blocks = document.querySelectorAll(".mermaid-block");
+  if (Board.debugLog) Board.debugLog('initMermaid.call', {
+    defined: defined, blockCount: blocks.length,
+  });
+  if (!defined) return;
   blocks.forEach(function (block) {
-    const id = block.dataset.mermaidId;
     if (block.dataset.rendered) return;
     block.dataset.rendered = "true";
-    const code = block.textContent;
-    if (typeof mermaid !== "undefined") {
-      mermaid.render(id, code).then(function (result) {
-        block.innerHTML = result.svg;
-      }).catch(function (err) {
-        console.warn('[initMermaid] Mermaid render failed for id=' + id + ':', err);
-        cleanupMermaidOrphans(id);
-        block.innerHTML = '<pre class="wf-file-content">' + esc(code) + '</pre>';
+    var id = block.dataset.mermaidId;
+    var code = block.textContent;
+    if (Board.debugLog) Board.debugLog('initMermaid.render', {
+      id: id, codeHead: code.slice(0, 80),
+    });
+    mermaid.render(id, code).then(function (result) {
+      block.innerHTML = result.svg;
+      if (Board.debugLog) Board.debugLog('initMermaid.success', { id: id });
+    }).catch(function (err) {
+      console.warn('[initMermaid] Mermaid render failed for id=' + id + ':', err);
+      if (Board.debugLog) Board.debugLog('initMermaid.fail', {
+        id: id, err: String(err && err.message || err),
       });
-    }
+      cleanupMermaidOrphans(id);
+      block.innerHTML = '<pre class="wf-file-content">' + esc(code) + '</pre>';
+    });
   });
 }
+
+// async 스크립트 로드 완료 시점에 한 번 더 스캔하여 race window 보충.
+function _mermaidRescanWhenReady() {
+  if (typeof mermaid !== "undefined") { initMermaid(); return; }
+  var script = document.querySelector('script[src*="mermaid"]');
+  if (script) script.addEventListener('load', function () { initMermaid(); }, { once: true });
+}
+_mermaidRescanWhenReady();
 
 Board.render.renderMd = renderMd;
 Board.render.initMermaid = initMermaid;
@@ -556,6 +710,74 @@ Board.state.dashChartInstances = {};
 // Kanban sort state
 Board.state.kanbanSort = null; // initialized by kanban.js
 
+// Roadmap subtab state — saveUI/loadUI 로 영속화 (활성 phase + 펼친 카드 + 사이드 너비).
+// Contexts 탭(구 Prompt 탭) 의 Roadmap 서브탭이 사용한다 — 별도 패널이 아니므로 panelOpen 없음.
+Board.state.roadmap = (savedState.roadmap && typeof savedState.roadmap === "object")
+  ? {
+      activePhaseId: typeof savedState.roadmap.activePhaseId === "string"
+        ? savedState.roadmap.activePhaseId
+        : null,
+      expandedCardIds: Array.isArray(savedState.roadmap.expandedCardIds)
+        ? savedState.roadmap.expandedCardIds.slice()
+        : [],
+      sideWidth: typeof savedState.roadmap.sideWidth === "number"
+        && savedState.roadmap.sideWidth >= 140 && savedState.roadmap.sideWidth <= 600
+        ? savedState.roadmap.sideWidth
+        : 240,
+    }
+  : {
+      activePhaseId: null,
+      expandedCardIds: [],
+      sideWidth: 240,
+    };
+
+// Contexts 탭 통합 상태 — saveUI/loadUI 로 영속화.
+// 사용자 이벤트(서브탭 전환, 파일 선택, sidebar 너비 조정, GC bar 토글) 가 모두 새로고침
+// 후 복원되어야 한다는 정책. 각 서브탭 모듈이 default 하드코드 대신 여기서 읽어간다.
+(function () {
+  var rawCx = (savedState.contexts && typeof savedState.contexts === "object")
+    ? savedState.contexts : {};
+  var ALLOWED_SUBTABS = { roadmap: 1, rules: 1, memory: 1, prompt: 1 };
+  var sub = (typeof rawCx.subTab === "string" && ALLOWED_SUBTABS[rawCx.subTab])
+    ? rawCx.subTab : "roadmap";
+  function _ws(v, def) {
+    if (typeof v === "number" && v >= 140 && v <= 600) return v;
+    return def;
+  }
+  function _sub(o) {
+    o = (o && typeof o === "object") ? o : {};
+    return {
+      activeFile: typeof o.activeFile === "string" ? o.activeFile : null,
+      sidebarWidth: _ws(o.sidebarWidth, 280),
+    };
+  }
+  var memorySub = _sub(rawCx.memory);
+  memorySub.gcExpanded = !!(rawCx.memory && rawCx.memory.gcExpanded);
+  Board.state.contexts = {
+    subTab: sub,
+    memory: memorySub,
+    rules: _sub(rawCx.rules),
+    prompt: _sub(rawCx.prompt),
+  };
+})();
+
+// Relations panel state — saveUI/loadUI 로 영속화 (열림/닫힘 + 필터)
+Board.state.relations = (savedState.relations && typeof savedState.relations === "object")
+  ? {
+      filter: {
+        statuses: Array.isArray(savedState.relations.filter && savedState.relations.filter.statuses)
+          ? savedState.relations.filter.statuses
+          : ["open", "progress", "review", "done"],
+        direction: (savedState.relations.filter && savedState.relations.filter.direction) || "TD",
+        showIsolated: !!(savedState.relations.filter && savedState.relations.filter.showIsolated),
+      },
+      panelOpen: !!savedState.relations.panelOpen,
+    }
+  : {
+      filter: { statuses: ["open", "progress", "review", "done"], direction: "TD", showIsolated: false },
+      panelOpen: false,
+    };
+
 // ── UI State Persistence ──
 
 /** Saves current UI state to localStorage. */
@@ -567,6 +789,9 @@ function saveUI() {
     activeViewerTab: Board.state.activeViewerTab,
     tabHistory: Board.state.tabHistory,
     forwardHistory: Board.state.forwardHistory,
+    relations: Board.state.relations,
+    roadmap: Board.state.roadmap,
+    contexts: Board.state.contexts,
   };
   try { localStorage.setItem(LS_KEY, JSON.stringify(state)); } catch (e) {}
 }
@@ -639,4 +864,28 @@ function fetchXmlList(dirUrl) {
 }
 
 Board.util.fetchXmlList = fetchXmlList;
+
+// ── Branch Status Bar Helper ──
+//
+// 상태바(`#terminal-sl-branch`)에 git 브랜치명과 아이콘 SVG 를 그린다.
+// terminal/workflow 페이지 둘 다, 페이지 로드 시점·SSE git_branch 이벤트·
+// /api/branch fetch 결과 등 어디서든 단일 헬퍼로 갱신한다.
+//
+// 상태바 element 가 없는 페이지(kanban/dashboard 등)에서는 no-op.
+var BRANCH_ICON_SVG =
+  '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" '
+  + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
+  + 'stroke-linejoin="round" style="vertical-align:-1px;margin-right:3px">'
+  + '<circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/>'
+  + '<path d="M6 15V9a6 6 0 0 0 6-6h0a6 6 0 0 0 6 6"/></svg>';
+
+function setBranchStatusBar(branchName) {
+  if (!branchName) return;
+  var el = document.getElementById("terminal-sl-branch");
+  if (!el) return;
+  el.innerHTML = BRANCH_ICON_SVG + branchName;
+}
+
+Board.util.setBranchStatusBar = setBranchStatusBar;
+Board.util.BRANCH_ICON_SVG = BRANCH_ICON_SVG;
 

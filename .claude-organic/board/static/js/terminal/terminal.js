@@ -145,8 +145,15 @@
   // ── Board.state init ──
   Board.state.termConnected = false;
   Board.state.termSessionId = M.isWorkflowMode ? M.workflowSessionId : null;
-  Board.state.termStatus = M.isWorkflowMode ? "running" : "stopped";
+  // 워크플로우 모드는 서버 측 채널이 이미 실행 중이라 idle 로 시작한다.
+  // 메인 모드는 Start 전이므로 stopped.
+  Board.state.termStatus = M.isWorkflowMode ? "idle" : "stopped";
   Board.state.termLastSessionId = null;
+
+  if (Board.debugLog) Board.debugLog('terminal.init', {
+    isWorkflowMode: M.isWorkflowMode, termStatus: Board.state.termStatus,
+    href: location.href,
+  });
 
   // ── Output Clear ──
 
@@ -158,55 +165,81 @@
 
   // ── UI Update ──
 
+  M.showRestartOverlay = function() {
+    if (document.querySelector(".terminal-restart-overlay")) return;
+    var overlay = document.createElement("div");
+    overlay.className = "terminal-restart-overlay";
+    var spinner = document.createElement("div");
+    spinner.className = "terminal-restart-overlay-spinner";
+    var label = document.createElement("div");
+    label.className = "terminal-restart-overlay-label";
+    label.textContent = "서버 재기동 중...";
+    overlay.appendChild(spinner);
+    overlay.appendChild(label);
+    document.body.appendChild(overlay);
+  };
+
   M.updateControlBar = function() {
-    var startBtn = document.getElementById("terminal-start-btn");
-    var killBtn = document.getElementById("terminal-kill-btn");
-    var resumeBtn = document.getElementById("terminal-resume-btn");
+    var toggleBtn = document.getElementById("terminal-toggle-btn");
     var statusDot = document.getElementById("terminal-status-dot");
     var statusText = document.getElementById("terminal-status-text");
     var isMainActive = M._activeSessionId === "main";
-    if (startBtn) {
-      // Start 버튼은 main 탭(메인 세션) 활성 시에만 표시한다.
+    var status = Board.state.termStatus;
+    var killable = Board.util.TERM_STATUS_KILLABLE.has(status);
+    var inputtable = Board.util.TERM_STATUS_INPUTTABLE.has(status);
+    var isStopped = status === "stopped";
+    var isBusy = status === "busy";
+    if (toggleBtn) {
+      // 토글 버튼은 main 탭 활성 시에만 표시한다.
       if (!isMainActive) {
-        startBtn.style.display = "none";
+        toggleBtn.style.display = "none";
+      } else if (status === "archived" || status === "missing") {
+        // archived/missing 에선 Start/Kill 모두 의미 없음.
+        toggleBtn.style.display = "none";
+      } else if (killable) {
+        toggleBtn.style.display = "";
+        toggleBtn.textContent = "Close";
+        toggleBtn.classList.add("terminal-btn-kill");
+        toggleBtn.classList.remove("terminal-btn-start");
+        toggleBtn.disabled = false;
       } else {
-        startBtn.style.display = "";
-        startBtn.disabled = Board.state.termStatus !== "stopped";
+        // stopped
+        toggleBtn.style.display = "";
+        toggleBtn.textContent = "Start";
+        toggleBtn.classList.add("terminal-btn-start");
+        toggleBtn.classList.remove("terminal-btn-kill");
+        toggleBtn.disabled = false;
       }
     }
-    if (resumeBtn) {
-      // Resume 버튼은 main 탭 활성 + stopped 상태 + termLastSessionId 존재 시에만 표시한다.
-      var showResume = isMainActive
-        && Board.state.termStatus === "stopped"
-        && !!Board.state.termLastSessionId;
-      resumeBtn.style.display = showResume ? "" : "none";
-    }
-    var browseBtn = document.getElementById("terminal-browse-btn");
-    if (browseBtn) {
-      // Browse 토글 버튼은 main 탭 활성 + stopped 상태일 때만 표시한다.
-      var showBrowse = isMainActive && Board.state.termStatus === "stopped";
-      browseBtn.style.display = showBrowse ? "" : "none";
-    }
-    if (killBtn) {
-      killBtn.disabled = Board.state.termStatus === "stopped";
+    var memoryBtn = document.getElementById("terminal-memory-btn");
+    if (memoryBtn) {
+      if (!isMainActive) {
+        memoryBtn.style.display = "none";
+      } else {
+        memoryBtn.style.display = "";
+        memoryBtn.disabled = !inputtable;
+      }
     }
     var loginBtn = document.getElementById("terminal-login");
     if (loginBtn) {
-      loginBtn.disabled = Board.state.termStatus === "stopped";
+      loginBtn.disabled = !inputtable;
     }
     if (statusDot) {
-      statusDot.className = "terminal-status-dot terminal-status-" + Board.state.termStatus;
+      statusDot.className = "terminal-status-dot terminal-status-" + status;
     }
     var statusContainer = document.querySelector(".terminal-status");
     if (statusContainer) {
-      statusContainer.setAttribute("data-state", Board.state.termStatus);
+      statusContainer.setAttribute("data-state", status);
     }
     if (statusText) {
-      statusText.textContent = Board.state.termStatus;
+      var labels = Board.util.TERM_STATUS_LABELS || {};
+      statusText.textContent = labels[status] || status;
     }
     var sessionIdEl = document.getElementById("terminal-session-id");
     if (sessionIdEl) {
-      sessionIdEl.textContent = Board.state.termSessionId || '';
+      // stopped 상태에선 .last-session-id 에서 복원된 UUID 가 남아있어도 숨긴다.
+      // 과거 세션은 Sessions 드롭다운에서 명시적으로 resume 한다.
+      sessionIdEl.textContent = (!isStopped && Board.state.termSessionId) ? Board.state.termSessionId : '';
     }
 
     var inputCard = document.querySelector(".terminal-input-card");
@@ -224,15 +257,23 @@
         sendBtn.style.display = "none";
       } else {
         sendBtn.style.display = "";
-        var isRunning = Board.state.termStatus === "running";
-        if (isRunning) {
+        if (M._interruptInFlight) {
+          // interrupt 후 result 대기 중 — 버튼을 잠시 비활성화하여 재클릭 차단
+          // 및 사용자에게 처리 중임을 시각적으로 알린다. result 도착 시
+          // _onResult 가 플래그를 끄고 updateControlBar 호출.
+          sendBtn.classList.add("is-stop");
+          sendBtn.disabled = true;
+          sendBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>';
+          sendBtn.onclick = null;
+        } else if (isBusy) {
+          // busy: Claude 응답 중 → interrupt 버튼
           sendBtn.classList.add("is-stop");
           sendBtn.disabled = false;
           sendBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>';
           sendBtn.onclick = function (e) { e.stopPropagation(); M.interruptSession(); };
         } else {
           sendBtn.classList.remove("is-stop");
-          sendBtn.disabled = Board.state.termStatus === "stopped";
+          sendBtn.disabled = !inputtable;
           sendBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>';
           sendBtn.onclick = function (e) { e.stopPropagation(); M.sendInput(); };
         }
@@ -243,13 +284,19 @@
     if (hintEl) {
       if (M.isWorkflowMode) {
         hintEl.textContent = "자동 실행 전용";
-      } else if (Board.state.termStatus === "running") {
+      } else if (isBusy) {
         var queueLen = M.inputQueue.length;
         if (queueLen > 0) {
           hintEl.textContent = "ESC 중지 \u00B7 대기 " + queueLen + "개";
         } else {
           hintEl.textContent = "ESC 중지";
         }
+      } else if (status === "starting") {
+        hintEl.textContent = "Starting session...";
+      } else if (status === "archived") {
+        hintEl.textContent = "Read-only (archived)";
+      } else if (status === "missing") {
+        hintEl.textContent = "Session not found";
       } else {
         hintEl.textContent = "Enter 전송 \u00B7 Shift+Enter 줄바꿈";
       }
@@ -260,6 +307,10 @@
   };
 
   M.updateStatusLine = function() {
+    if (Board.debugLog) Board.debugLog('updateStatusLine', {
+      input: M.sessionTokens.input, output: M.sessionTokens.output,
+      ctxWindow: M.contextWindow, activeSession: M._activeSessionId,
+    });
     var slModel = document.getElementById("terminal-sl-model");
     var slTokens = document.getElementById("terminal-sl-tokens");
     var slCost = document.getElementById("terminal-sl-cost");
@@ -268,15 +319,9 @@
 
     var slBranch = document.getElementById("terminal-sl-branch");
     if (slBranch) {
-      var branchText = slBranch.textContent.replace(/^\ue0a0\s*/, "").trim();
-      if (!branchText || branchText === "--") branchText = slBranch.textContent.trim();
-      var existingSvg = slBranch.querySelector("svg");
-      if (existingSvg) {
-        branchText = slBranch.textContent.trim();
-        existingSvg.remove();
-      }
+      var branchText = slBranch.textContent.trim();
       if (branchText && branchText !== "--") {
-        slBranch.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:3px"><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M6 15V9a6 6 0 0 0 6-6h0a6 6 0 0 0 6 6"/></svg>' + branchText;
+        Board.util.setBranchStatusBar(branchText);
       }
     }
 
@@ -330,7 +375,7 @@
             M._activeSessionId = "main";
             delete M._sessionMap[failedId];
             Board.state.termSessionId = null;
-            Board.state.termStatus = "stopped";
+            Board.state.setTermStatus("stopped");
             try { history.replaceState(null, "", "terminal.html"); } catch (e) {}
             M._initialFallbackMessage =
               "[Error] URL 세션 '" + failedId + "'을 찾을 수 없어 메인 세션으로 전환했습니다.";
@@ -367,21 +412,14 @@
       + '</span>';
     h += '</div>';
     h += '<div class="terminal-session-controls">';
-    h += '<div class="terminal-start-group" id="terminal-start-group">';
-    h += '<button class="terminal-btn terminal-btn-start" id="terminal-start-btn">Start</button>';
-    h += '<button class="terminal-btn terminal-btn-resume" id="terminal-resume-btn">Resume</button>';
-    h += '<button class="terminal-btn terminal-btn-browse" id="terminal-browse-btn" title="Browse sessions" style="display:none">&#x25BE;</button>';
-    h += '<div class="terminal-browse-dropdown" id="terminal-browse-dropdown">';
-    h += '<button class="terminal-browse-item" id="terminal-browse-new">New Session</button>';
-    h += '<button class="terminal-browse-item" id="terminal-browse-resume-last">Resume Last</button>';
-    h += '<div class="terminal-browse-divider"></div>';
-    h += '<button class="terminal-browse-item" id="terminal-browse-sessions">Browse Sessions...</button>';
-    h += '<div class="terminal-browse-session-list" id="terminal-browse-session-list" style="display:none"></div>';
-    h += '</div>';
-    h += '</div>';
-    h += '<button class="terminal-btn terminal-btn-kill" id="terminal-kill-btn">Kill</button>';
+    h += '<button class="terminal-btn terminal-btn-start" id="terminal-toggle-btn">Start</button>';
     h += '<span class="terminal-controls-divider"></span>';
-    h += '<button class="terminal-btn terminal-btn-sessions" id="terminal-sessions-btn" title="Workflow sessions">';
+    h += '<button class="terminal-btn terminal-btn-memory" id="terminal-memory-btn" title="메모리 로드 (현재 세션에 MEMORY.md 재인지 요청)">';
+    h += '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"/></svg>';
+    h += '<span>Memory</span>';
+    h += '</button>';
+    h += '<span class="terminal-controls-divider"></span>';
+    h += '<button class="terminal-btn terminal-btn-sessions" id="terminal-sessions-btn" title="Main sessions">';
     h += '<span id="terminal-sessions-label">Sessions</span>';
     h += '<span class="terminal-sessions-count" id="terminal-sessions-count" style="display:none"></span>';
     h += '</button>';
@@ -421,19 +459,19 @@
     h += '<textarea class="terminal-input" id="terminal-input"'
       + ' placeholder="메시지를 입력하세요..." rows="1"'
       + ' autocomplete="off" spellcheck="false"'
-      + (Board.state.termStatus === "stopped" ? " disabled" : "")
+      + (Board.util.TERM_STATUS_INPUTTABLE.has(Board.state.termStatus) ? "" : " disabled")
       + '></textarea>';
     h += '<div class="terminal-input-bottom">';
     h += '<div class="terminal-input-bottom-left">';
     h += '<button class="terminal-attach-btn" id="terminal-attach-btn" title="이미지 첨부"'
-      + (Board.state.termStatus === "stopped" ? " disabled" : "")
+      + (Board.util.TERM_STATUS_INPUTTABLE.has(Board.state.termStatus) ? "" : " disabled")
       + '><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></button>';
     h += '<input type="file" id="terminal-attach-input" accept="image/png,image/jpeg,image/gif,image/webp" style="display:none" multiple>';
     h += '</div>';
     h += '<div class="terminal-input-bottom-right">';
     h += '<span class="terminal-input-hint">Enter 전송 \u00B7 Shift+Enter 줄바꿈</span>';
     h += '<button class="terminal-send-btn" id="terminal-send-btn"'
-      + (Board.state.termStatus === "stopped" ? " disabled" : "")
+      + (Board.util.TERM_STATUS_INPUTTABLE.has(Board.state.termStatus) ? "" : " disabled")
       + '><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg></button>';
     h += '</div>';
     h += '</div>';
@@ -512,11 +550,23 @@
         clearCurrentToolBox: function () { M.currentToolBox = null; },
         getToolBoxMap: function () { return M.toolBoxMap; },
         resetToolBoxMap: function () { M.toolBoxMap = {}; },
-        resetTokens: function () { M.sessionTokens = { input: 0, output: 0 }; M.sessionCost = 0; },
+        resetTokens: function () {
+          if (Board.debugLog) Board.debugLog('resetTokens', {
+            prev: { input: M.sessionTokens.input, output: M.sessionTokens.output },
+            stack: new Error().stack.split('\n').slice(1, 5).join(' | '),
+          });
+          M.sessionTokens = { input: 0, output: 0 };
+          M.sessionCost = 0;
+        },
         setSessionCost: function (v) { M.sessionCost = v; },
         addInputTokens: function (n) { M.sessionTokens.input += n; },
         addOutputTokens: function (n) { M.sessionTokens.output += n; },
-        setInputTokens: function (n) { M.sessionTokens.input = n; },
+        setInputTokens: function (n) {
+          if (Board.debugLog && n !== M.sessionTokens.input) Board.debugLog('setInputTokens', {
+            prev: M.sessionTokens.input, next: n,
+          });
+          M.sessionTokens.input = n;
+        },
         setOutputTokens: function (n) { M.sessionTokens.output = n; },
         getSessionTokens: function () { return M.sessionTokens; },
         setSessionModel: function (v) { M.sessionModel = v; },
@@ -543,7 +593,23 @@
     // Connect SSE
     if (Board.session) {
       Board.session.connectSSE();
-      Board.session.fetchStatus();
+      var statusPromise = Board.session.fetchStatus();
+      // 메인 세션 한정: 상태 확정 후 히스토리 복원 또는 빈 상태 표시.
+      // session_id 는 .last-session-id 에서 복원될 수 있어 stopped 상태에도
+      // 남아 있다. 세션이 실제 살아 있을 때(= stopped 아님)만 자동 복원한다.
+      // Start 전 빈 화면을 유지하고, 과거 세션은 드롭다운에서 명시적으로
+      // resume 하는 흐름.
+      if (!M.isWorkflowMode && statusPromise && typeof statusPromise.then === "function") {
+        statusPromise.then(function () {
+          var sid = Board.state.termSessionId;
+          var status = Board.state.termStatus;
+          if (sid && status && status !== "stopped") {
+            M.loadHistory(sid);
+          } else {
+            M.showEmptyState();
+          }
+        });
+      }
     }
 
     // D5 #5: URL 세션 사전 검증 실패 알림 (렌더 후 M.outputDiv 준비 완료 시점)
@@ -553,129 +619,18 @@
     }
 
     // Bind event handlers
-    var startBtn = document.getElementById("terminal-start-btn");
-    var killBtn = document.getElementById("terminal-kill-btn");
+    var toggleBtn = document.getElementById("terminal-toggle-btn");
     var inputEl = document.getElementById("terminal-input");
 
-    if (startBtn) {
-      startBtn.addEventListener("click", function () { Board.session.startSession(); });
-    }
-    var resumeBtn = document.getElementById("terminal-resume-btn");
-    if (resumeBtn) {
-      resumeBtn.addEventListener("click", function () {
-        Board.session.startSession(Board.state.termLastSessionId);
-      });
-    }
-    if (killBtn) {
-      killBtn.addEventListener("click", function () { Board.session.killSession(); });
-    }
-
-    // Browse sessions dropdown
-    var browseBtn = document.getElementById("terminal-browse-btn");
-    var browseDropdown = document.getElementById("terminal-browse-dropdown");
-    var browseNewBtn = document.getElementById("terminal-browse-new");
-    var browseResumeLastBtn = document.getElementById("terminal-browse-resume-last");
-    var browseSessionsBtn = document.getElementById("terminal-browse-sessions");
-    var browseSessionList = document.getElementById("terminal-browse-session-list");
-
-    if (browseBtn && browseDropdown) {
-      browseBtn.addEventListener("click", function (e) {
-        e.stopPropagation();
-        browseDropdown.classList.toggle("visible");
-        if (browseSessionList) {
-          browseSessionList.style.display = "none";
+    if (toggleBtn) {
+      toggleBtn.addEventListener("click", function () {
+        var status = Board.state.termStatus;
+        if (status === "stopped") {
+          Board.session.startSession();
+        } else if (Board.util.TERM_STATUS_KILLABLE.has(status)) {
+          Board.session.killSession();
         }
-      });
-      document.addEventListener("click", function () {
-        browseDropdown.classList.remove("visible");
-        if (browseSessionList) {
-          browseSessionList.style.display = "none";
-        }
-      });
-    }
-
-    if (browseNewBtn) {
-      browseNewBtn.addEventListener("click", function (e) {
-        e.stopPropagation();
-        browseDropdown.classList.remove("visible");
-        Board.session.startSession();
-      });
-    }
-
-    if (browseResumeLastBtn) {
-      browseResumeLastBtn.addEventListener("click", function (e) {
-        e.stopPropagation();
-        browseDropdown.classList.remove("visible");
-        if (Board.state.termLastSessionId) {
-          Board.session.startSession(Board.state.termLastSessionId);
-        }
-      });
-    }
-
-    if (browseSessionsBtn && browseSessionList) {
-      browseSessionsBtn.addEventListener("click", function (e) {
-        e.stopPropagation();
-        var isVisible = browseSessionList.style.display !== "none";
-        if (isVisible) {
-          browseSessionList.style.display = "none";
-          return;
-        }
-        browseSessionList.innerHTML = '<div class="terminal-browse-loading">세션 목록을 불러오는 중...</div>';
-        browseSessionList.style.display = "block";
-        fetch("/terminal/sessions", { cache: "no-store" }).then(function (res) {
-          if (!res.ok) throw new Error("HTTP " + res.status);
-          return res.json();
-        }).then(function (sessions) {
-          browseSessionList.innerHTML = "";
-          if (!sessions || sessions.length === 0) {
-            browseSessionList.innerHTML = '<div class="terminal-browse-empty">최근 세션 없음</div>';
-            return;
-          }
-          sessions.forEach(function (s) {
-            var fullId = s.session_id || "";
-            var shortId = fullId.substring(0, 8);
-
-            var item = document.createElement("button");
-            item.className = "terminal-browse-item terminal-browse-session-item";
-            if (s.is_current) item.className += " current";
-            item.setAttribute("title", fullId + (s.is_current ? " (현재 세션)" : ""));
-            item.setAttribute("data-session-id", fullId);
-
-            var idSpan = document.createElement("span");
-            idSpan.className = "terminal-browse-session-id";
-            idSpan.textContent = shortId;
-
-            var timeSpan = document.createElement("span");
-            timeSpan.className = "terminal-browse-session-time";
-            timeSpan.textContent = M.formatRelativeTime(s.last_active);
-            try {
-              var dtAbs = new Date(s.last_active);
-              if (!isNaN(dtAbs.getTime())) {
-                timeSpan.setAttribute("title", dtAbs.toLocaleString("ko-KR"));
-              }
-            } catch (_eAbs) { /* no-op */ }
-
-            item.appendChild(idSpan);
-            if (s.is_current) {
-              var currentLabel = document.createElement("span");
-              currentLabel.className = "terminal-browse-current-label";
-              currentLabel.textContent = "현재";
-              item.appendChild(currentLabel);
-            }
-            item.appendChild(timeSpan);
-
-            item.addEventListener("click", function (ev) {
-              ev.stopPropagation();
-              browseDropdown.classList.remove("visible");
-              browseSessionList.style.display = "none";
-              Board.session.startSession(fullId);
-            });
-            browseSessionList.appendChild(item);
-          });
-        }).catch(function (err) {
-          var msg = err && err.message ? err.message : "알 수 없는 오류";
-          browseSessionList.innerHTML = '<div class="terminal-browse-error">세션 목록 로드 실패 (' + M.escapeHtml(msg) + ')</div>';
-        });
+        // archived/missing: 버튼 자체가 숨겨져 클릭 도달 안 함 (방어 용도)
       });
     }
 
@@ -695,6 +650,7 @@
     if (restartBtn) {
       restartBtn.addEventListener("click", function () {
         settingsDropdown.classList.remove("visible");
+        M.showRestartOverlay();
         Board.session.postJson("/api/restart").then(function () {
           setTimeout(function () { location.reload(); }, 1500);
         }).catch(function () {
@@ -706,7 +662,7 @@
     if (loginBtn) {
       loginBtn.addEventListener("click", function () {
         settingsDropdown.classList.remove("visible");
-        if (Board.state.termStatus === "stopped") return;
+        if (!Board.util.TERM_STATUS_INPUTTABLE.has(Board.state.termStatus)) return;
         Board.session.postJson("/terminal/command", { command: "/login" }).catch(function (err) {
           M.appendErrorMessage("[Error] Login failed: " + err.message);
         });
@@ -749,10 +705,11 @@
           return;
         }
         // image/* 가 없으면 text/plain 경로 패턴 확인
+        // 작은따옴표로 감싸 "/" 로 시작하는 경로가 슬래시 커맨드로 오인되는 것을 차단한다.
         var text = e.clipboardData.getData("text/plain");
         if (text && M.isFilePath(text)) {
           e.preventDefault();
-          M.insertTextAtCursor(inputEl, text);
+          M.insertTextAtCursor(inputEl, "'" + text + "'");
         }
         // 경로가 아닌 일반 텍스트는 기본 paste 동작에 위임
       });
@@ -823,9 +780,10 @@
         }
 
         // (b) text/plain 이 경로 패턴이면 textarea에 경로 삽입
+        // 작은따옴표로 감싸 "/" 로 시작하는 경로가 슬래시 커맨드로 오인되는 것을 차단한다.
         var dropText = dt.getData("text/plain");
         if (dropText && M.isFilePath(dropText)) {
-          M.insertTextAtCursor(targetInput, dropText);
+          M.insertTextAtCursor(targetInput, "'" + dropText + "'");
           return;
         }
         // (c) 둘 다 아니면 무시 (시나리오 C, Chromium CF_HDROP 버그)
@@ -851,7 +809,7 @@
 
     // Keyboard shortcuts
     document.addEventListener("keydown", function (e) {
-      if (e.key === "Escape" && !M.isWorkflowMode && Board.state.termStatus === "running") {
+      if (e.key === "Escape" && !M.isWorkflowMode && Board.state.termStatus === "busy") {
         e.preventDefault();
         M.interruptSession();
         return;
@@ -859,6 +817,20 @@
     });
 
     M.termInitialized = true;
+
+    // Memory load shortcut: 현재 메인 세션(특히 resume 직후)에 메모리 재인지 요청
+    var memoryBtn = document.getElementById("terminal-memory-btn");
+    if (memoryBtn) {
+      memoryBtn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        if (M.isWorkflowMode) return;
+        if (!Board.util.TERM_STATUS_INPUTTABLE.has(Board.state.termStatus)) return;
+        var input = document.getElementById("terminal-input");
+        if (!input) return;
+        input.value = "메모리 로드하세요";
+        M.sendInput();
+      });
+    }
 
     // Workflow sessions dropdown
     var sessionsBtn = document.getElementById("terminal-sessions-btn");
@@ -988,12 +960,9 @@
       Board.workflowSessions.refresh(M.workflowSessionId, M.isWorkflowMode);
     }, 5000);
 
-    // Fetch branch on load
+    // Fetch branch on load — SSE git_branch 이벤트(core/sse.js)가 후속 갱신을 담당한다.
     fetch("/api/branch").then(function (r) { return r.json(); }).then(function (d) {
-      if (d.branch) {
-        var brEl = document.getElementById("terminal-sl-branch");
-        if (brEl) brEl.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:3px"><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M6 15V9a6 6 0 0 0 6-6h0a6 6 0 0 0 6 6"/></svg>' + d.branch;
-      }
+      Board.util.setBranchStatusBar(d.branch);
     }).catch(function () {});
   };
 

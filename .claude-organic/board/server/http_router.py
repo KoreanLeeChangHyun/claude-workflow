@@ -70,18 +70,22 @@ class BoardHTTPRequestHandler(
             self._handle_sse()
         elif self.path == '/poll':
             self._handle_poll()
-        elif self.path == '/terminal/events':
+        elif self.path.startswith('/terminal/events'):
             self._handle_terminal_sse()
         elif self.path == '/terminal/status':
             self._handle_terminal_status()
         elif self.path == '/terminal/sessions':
             self._handle_terminal_sessions()
+        elif self.path.startswith('/terminal/history'):
+            self._handle_terminal_history()
         elif self.path.startswith('/terminal/workflow/status'):
             self._handle_workflow_status()
         elif self.path.startswith('/terminal/workflow/events'):
             self._handle_workflow_sse()
         elif self.path == '/terminal/workflow/list':
             self._handle_workflow_list()
+        elif self.path.startswith('/terminal/workflow/history'):
+            self._handle_workflow_history()
         elif self.path.startswith('/api/'):
             self._handle_api()
         else:
@@ -101,6 +105,8 @@ class BoardHTTPRequestHandler(
                 self.end_headers()
         elif self.path == '/api/restart':
             self._handle_restart()
+        elif self.path == '/api/debug-log':
+            self._handle_debug_log()
         elif self.path == '/api/workflow/sync':
             self._handle_workflow_sync()
         elif self.path == '/terminal/start':
@@ -131,6 +137,10 @@ class BoardHTTPRequestHandler(
             self._handle_prompt_write()
         elif self.path == '/api/prompt/claude-md':
             self._handle_claude_md_write()
+        elif self.path == '/api/memory/gc/run':
+            self._handle_memory_gc_run()
+        elif self.path == '/api/memory/gc/prune-archive':
+            self._handle_memory_gc_prune()
         else:
             self.send_response(404)
             self.end_headers()

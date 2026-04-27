@@ -9,19 +9,24 @@
   var esc = Board.util.esc;
   var M = (Board._memory = Board._memory || {});
 
-  // ── State: Prompt tab (shared) ──
-  Board.state.promptSubTab = "claudemd"; // "rules" | "prompt" | "claudemd" | "memory"
+  // ── State: Contexts tab (shared) ──
+  // 서브탭: roadmap | rules | memory | prompt
+  // CLAUDE.md 는 Rules 서브탭의 "Project Meta" 카테고리에 편입되어 별도 서브탭이 아니다.
+  // 사용자 선택은 Board.state.contexts (common.js, localStorage 영속) 가 단일 진실 공급원.
+  // 아래 변수들은 영속 상태에서 read-only 미러 — 변경 시 M.persistContexts() 호출 필수.
+  var _cx = Board.state.contexts || { subTab: "roadmap", memory: {}, rules: {}, prompt: {} };
+  Board.state.promptSubTab = _cx.subTab || "roadmap";
 
   // ── State: Rules sub-tab ──
   Board.state.promptRulesFiles = [];
-  Board.state.promptRulesActiveFile = null;
+  Board.state.promptRulesActiveFile = (_cx.rules && _cx.rules.activeFile) || null;
   Board.state.promptRulesDirty = false;
   Board.state.promptRulesPreview = false;
   Board.state.promptRulesOriginalContent = "";
 
   // ── State: Prompt sub-tab ──
   Board.state.promptPromptFiles = [];
-  Board.state.promptPromptActiveFile = null;
+  Board.state.promptPromptActiveFile = (_cx.prompt && _cx.prompt.activeFile) || null;
   Board.state.promptPromptDirty = false;
   Board.state.promptPromptPreview = false;
   Board.state.promptPromptOriginalContent = "";
@@ -34,10 +39,22 @@
 
   // ── State: Memory sub-tab (existing) ──
   Board.state.memoryFiles = [];
-  Board.state.memoryActiveFile = null;
+  Board.state.memoryActiveFile = (_cx.memory && _cx.memory.activeFile) || null;
   Board.state.memoryDirty = false;
   Board.state.memoryPreview = false;
   Board.state.memoryOriginalContent = "";
+
+  // 영속 상태 동기화 — 모든 사용자 이벤트(서브탭 전환·파일 선택·sidebar resize·GC bar 토글)
+  // 후 호출. Board.state 의 휘발 변수들을 contexts 객체에 반영하고 saveUI() 로 commit.
+  M.persistContexts = function () {
+    var cx = Board.state.contexts;
+    if (!cx) return;
+    cx.subTab = Board.state.promptSubTab;
+    if (cx.memory) cx.memory.activeFile = Board.state.memoryActiveFile;
+    if (cx.rules) cx.rules.activeFile = Board.state.promptRulesActiveFile;
+    if (cx.prompt) cx.prompt.activeFile = Board.state.promptPromptActiveFile;
+    if (Board.util && Board.util.saveUI) Board.util.saveUI();
+  };
 
   // ═══════════════════════════════════════════════════════════════════
   // Fetch Functions
@@ -83,13 +100,17 @@
       .catch(function () { return []; });
   };
 
+  // CLAUDE.md 가 Rules 사이드바 "Project Meta" 카테고리에 편입되었으므로,
+  // path === "CLAUDE.md" 인 special case 를 fetch/save/delete 시 분기 처리한다.
   M.fetchRulesFile = function(path) {
+    if (path === "CLAUDE.md") return M.fetchClaudeMd();
     return fetch("/api/prompt/rules/file?path=" + encodeURIComponent(path), { cache: "no-store" })
       .then(function (res) { return res.ok ? res.json() : null; })
       .catch(function () { return null; });
   };
 
   M.saveRulesFile = function(path, content) {
+    if (path === "CLAUDE.md") return M.saveClaudeMd(content);
     return fetch("/api/prompt/rules/file", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -99,6 +120,9 @@
   };
 
   M.deleteRulesFile = function(path) {
+    if (path === "CLAUDE.md") {
+      return Promise.resolve({ ok: false, error: "CLAUDE.md cannot be deleted." });
+    }
     return fetch("/api/prompt/rules/file?path=" + encodeURIComponent(path), { method: "DELETE" })
       .then(function (res) { return res.json(); })
       .catch(function () { return null; });
@@ -168,7 +192,6 @@
     var sub = Board.state.promptSubTab;
     if (sub === "rules") return Board.state.promptRulesDirty;
     if (sub === "prompt") return Board.state.promptPromptDirty;
-    if (sub === "claudemd") return Board.state.promptClaudeMdDirty;
     if (sub === "memory") return Board.state.memoryDirty;
     return false;
   };
@@ -190,7 +213,7 @@
     container.innerHTML =
       '<div class="prompt-view-wrapper">' +
         '<div class="prompt-subtab-bar">' +
-          M.renderSubTabButton("claudemd", "CLAUDE.md") +
+          M.renderSubTabButton("roadmap", "Roadmap") +
           M.renderSubTabButton("rules", "Rules") +
           M.renderSubTabButton("memory", "Memory") +
           M.renderSubTabButton("prompt", "Prompt") +
@@ -225,6 +248,7 @@
     }
 
     Board.state.promptSubTab = target;
+    M.persistContexts();
 
     // Update sub-tab bar active state
     var bar = document.querySelector(".prompt-subtab-bar");
@@ -241,16 +265,29 @@
   M.resetDirtyState = function(subTab) {
     if (subTab === "rules") Board.state.promptRulesDirty = false;
     else if (subTab === "prompt") Board.state.promptPromptDirty = false;
-    else if (subTab === "claudemd") Board.state.promptClaudeMdDirty = false;
     else if (subTab === "memory") Board.state.memoryDirty = false;
   };
 
   M.renderActiveSubTab = function() {
     var sub = Board.state.promptSubTab;
-    if (sub === "rules") M.renderSubRules();
-    else if (sub === "prompt") M.renderSubPromptFiles();
-    else if (sub === "claudemd") M.renderSubClaudeMd();
+    if (sub === "roadmap") M.renderSubRoadmap();
+    else if (sub === "rules") M.renderSubRules();
     else if (sub === "memory") M.renderSubMemory();
+    else if (sub === "prompt") M.renderSubPromptFiles();
+  };
+
+  // Roadmap 서브탭 — views/roadmap.js 가 등록한 진입점에 위임.
+  M.renderSubRoadmap = function() {
+    var content = document.getElementById("prompt-content");
+    if (!content) return;
+    if (Board.render.renderRoadmapSubtab) {
+      Board.render.renderRoadmapSubtab(content);
+    } else {
+      content.innerHTML = '<div class="memory-empty-icon" aria-hidden="true">'
+        + '<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">'
+        + '<path d="M12 2v20M2 12h20"/></svg></div>'
+        + '<p>Roadmap module not loaded.</p>';
+    }
   };
 
   // Compatibility: Board.render.renderMemory = M.renderPrompt
@@ -260,17 +297,27 @@
   // Resize Handle
   // ═══════════════════════════════════════════════════════════════════
 
-  M.bindResizeHandle = function(container) {
+  M.bindResizeHandle = function(container, kind) {
     var handle = container.querySelector(".memory-resize-handle");
     if (!handle) return;
     var sidebar = container.querySelector(".memory-sidebar");
     if (!sidebar) return;
+
+    // 저장된 width 즉시 적용 (kind = "memory" | "rules" | "prompt")
+    var cx = Board.state.contexts;
+    var bucket = (cx && kind && cx[kind]) ? cx[kind] : null;
+    if (bucket && typeof bucket.sidebarWidth === "number"
+        && bucket.sidebarWidth >= 140 && bucket.sidebarWidth <= 600) {
+      sidebar.style.width = bucket.sidebarWidth + "px";
+      sidebar.style.minWidth = bucket.sidebarWidth + "px";
+    }
 
     handle.addEventListener("mousedown", function (e) {
       e.preventDefault();
       handle.classList.add("dragging");
       var startX = e.clientX;
       var startW = sidebar.offsetWidth;
+      var lastW = startW;
 
       function onMove(ev) {
         var w = startW + (ev.clientX - startX);
@@ -278,11 +325,16 @@
         if (w > 600) w = 600;
         sidebar.style.width = w + "px";
         sidebar.style.minWidth = w + "px";
+        lastW = w;
       }
       function onUp() {
         handle.classList.remove("dragging");
         document.removeEventListener("mousemove", onMove);
         document.removeEventListener("mouseup", onUp);
+        if (bucket) {
+          bucket.sidebarWidth = lastW;
+          if (Board.util && Board.util.saveUI) Board.util.saveUI();
+        }
       }
       document.addEventListener("mousemove", onMove);
       document.addEventListener("mouseup", onUp);
@@ -454,14 +506,28 @@
     M.fetchMemoryList().then(function (files) {
       Board.state.memoryFiles = files;
 
+      // GC bar + body 2단 column 분리.
+      // prompt-subtab-content 는 row 라 wrapper 안에서 column 흐름을 잡아준다.
+      content.innerHTML =
+        '<div class="memory-vertical-wrap">' +
+          '<div class="memory-gc-host" id="memory-gc-host"></div>' +
+          '<div class="memory-body-host" id="memory-body-host"></div>' +
+        '</div>';
+      var bodyHost = document.getElementById("memory-body-host");
+      var gcHost = document.getElementById("memory-gc-host");
+
+      if (Board.render.renderMemoryGcBar) {
+        Board.render.renderMemoryGcBar(gcHost);
+      }
+
       if (!files || files.length === 0) {
-        content.innerHTML = M.renderMemoryEmptyState();
-        M.bindMemoryEmptyNewBtn(content);
+        bodyHost.innerHTML = M.renderMemoryEmptyState();
+        M.bindMemoryEmptyNewBtn(bodyHost);
         return;
       }
 
-      content.innerHTML = M.renderMemoryLayout();
-      M.bindResizeHandle(content);
+      bodyHost.innerHTML = M.renderMemoryLayout();
+      M.bindResizeHandle(bodyHost, "memory");
       M.renderMemorySidebar();
       M.bindMemoryToolbar();
       M.bindMemoryKeyboard();
@@ -520,31 +586,87 @@
     );
   };
 
+  // Memory GC 마이그레이션 후 type/archive 카테고리 그루핑.
+  // MEMORY.md 는 별도 최상단, 그 외는 (user / feedback / project / reference / archive/*) 순.
+  var MEMORY_CATEGORY_ORDER = [
+    "flat",
+    "user",
+    "feedback",
+    "project",
+    "reference",
+    "archive/merged",
+    "archive/synthesized",
+    "archive/stale",
+  ];
+  var MEMORY_CATEGORY_LABELS = {
+    "flat": "Uncategorized",
+    "user": "User",
+    "feedback": "Feedback",
+    "project": "Project",
+    "reference": "Reference",
+    "archive/merged": "Archive · Merged",
+    "archive/synthesized": "Archive · Synthesized",
+    "archive/stale": "Archive · Stale",
+  };
+
+  function _basename(p) {
+    var idx = p.lastIndexOf("/");
+    return idx >= 0 ? p.substring(idx + 1) : p;
+  }
+
+  function _renderMemoryItem(f) {
+    var isActive = f.name === Board.state.memoryActiveFile;
+    var classes = "memory-file-item";
+    if (isActive) classes += " active";
+    if (f.isIndex) classes += " is-index";
+    var icon = f.isIndex ? "&#9733;" : "&#128196;";
+    var sizeStr = M.formatFileSize(f.size);
+    var displayName = f.isIndex ? f.name : _basename(f.name);
+    return (
+      '<div class="' + classes + '" data-name="' + esc(f.name) + '">' +
+        '<span class="memory-file-item-icon">' + icon + '</span>' +
+        '<div class="memory-file-item-info">' +
+          '<div class="memory-file-item-name">' + esc(displayName) + '</div>' +
+          '<div class="memory-file-item-meta">' + sizeStr + ' &middot; ' + esc(f.mtime || "") + '</div>' +
+        '</div>' +
+        '<span class="memory-file-item-dirty"></span>' +
+      '</div>'
+    );
+  }
+
   M.renderMemorySidebar = function() {
     var list = document.getElementById("memory-file-list");
     if (!list) return;
 
-    var html = "";
-    var files = Board.state.memoryFiles;
+    var files = Board.state.memoryFiles || [];
+    var indexFile = null;
+    var groups = {};
     for (var i = 0; i < files.length; i++) {
       var f = files[i];
-      var isActive = f.name === Board.state.memoryActiveFile;
-      var classes = "memory-file-item";
-      if (isActive) classes += " active";
-      if (f.isIndex) classes += " is-index";
+      if (f.isIndex) { indexFile = f; continue; }
+      var cat = f.category || "flat";
+      if (!groups[cat]) groups[cat] = [];
+      groups[cat].push(f);
+    }
 
-      var icon = f.isIndex ? "&#9733;" : "&#128196;";
-      var sizeStr = M.formatFileSize(f.size);
+    var html = "";
+    if (indexFile) {
+      // MEMORY.md 는 카테고리 헤더 없이 단독 노출
+      html += '<div class="memory-cat-group is-index">' + _renderMemoryItem(indexFile) + '</div>';
+    }
 
-      html +=
-        '<div class="' + classes + '" data-name="' + esc(f.name) + '">' +
-          '<span class="memory-file-item-icon">' + icon + '</span>' +
-          '<div class="memory-file-item-info">' +
-            '<div class="memory-file-item-name">' + esc(f.name) + '</div>' +
-            '<div class="memory-file-item-meta">' + sizeStr + ' &middot; ' + esc(f.mtime || "") + '</div>' +
-          '</div>' +
-          '<span class="memory-file-item-dirty"></span>' +
-        '</div>';
+    var seen = {};
+    for (var c = 0; c < MEMORY_CATEGORY_ORDER.length; c++) {
+      var cat = MEMORY_CATEGORY_ORDER[c];
+      seen[cat] = true;
+      var catFiles = groups[cat];
+      if (!catFiles || catFiles.length === 0) continue;
+      html += _renderMemoryCategoryGroup(cat, catFiles);
+    }
+    // 예약 외 카테고리 (있으면)
+    for (var ck in groups) {
+      if (seen[ck]) continue;
+      html += _renderMemoryCategoryGroup(ck, groups[ck]);
     }
 
     list.innerHTML = html;
@@ -554,6 +676,23 @@
       items[j].addEventListener("click", M.onMemoryFileItemClick);
     }
   };
+
+  function _renderMemoryCategoryGroup(cat, catFiles) {
+    var label = MEMORY_CATEGORY_LABELS[cat] || cat;
+    var inner = "";
+    for (var k = 0; k < catFiles.length; k++) {
+      inner += _renderMemoryItem(catFiles[k]);
+    }
+    return (
+      '<div class="memory-cat-group" data-category="' + esc(cat) + '">' +
+        '<div class="memory-cat-header">' +
+          '<span class="memory-cat-label">' + esc(label) + '</span>' +
+          '<span class="memory-cat-count">' + catFiles.length + '</span>' +
+        '</div>' +
+        inner +
+      '</div>'
+    );
+  }
 
   M.onMemoryFileItemClick = function(e) {
     var item = e.currentTarget;
@@ -570,6 +709,7 @@
     Board.state.memoryActiveFile = name;
     Board.state.memoryDirty = false;
     Board.state.memoryPreview = true;
+    M.persistContexts();
 
     var list = document.getElementById("memory-file-list");
     if (list) {
@@ -710,6 +850,7 @@
       if (result && result.ok) {
         Board.state.memoryActiveFile = null;
         Board.state.memoryDirty = false;
+        M.persistContexts();
         M.renderSubMemory();
       } else {
         alert("Failed to delete file.");
@@ -735,6 +876,7 @@
       if (result && result.ok) {
         Board.state.memoryActiveFile = result.name;
         Board.state.memoryDirty = false;
+        M.persistContexts();
         M.renderSubMemory();
       } else {
         alert("Failed to create file.");
@@ -804,6 +946,7 @@
         if (!found) {
           Board.state.memoryActiveFile = null;
           Board.state.memoryDirty = false;
+          M.persistContexts();
           M.renderSubMemory();
           return;
         }

@@ -1,0 +1,340 @@
+/* Claude Code Workflow Board - Relations Panel Styles */
+
+/* ── Collapsible Panel (below header) ── */
+.relations-panel {
+  background: #252526;
+  border-bottom: 1px solid #2d2d2d;
+  overflow: hidden;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.relations-panel:hover {
+  background: #2a2a2b;
+}
+.relations-panel.open {
+  cursor: default;
+  background: #1e1e1e;
+}
+.relations-panel.open:hover {
+  background: #1e1e1e;
+}
+
+/* ── Collapsed Bar (horizontal, like Done column) ── */
+.relations-collapsed-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 27px;
+  padding: 0 16px;
+  user-select: none;
+}
+.relations-panel.open .relations-collapsed-bar {
+  display: none;
+}
+
+.relations-collapsed-bar .bar-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #858585;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.relations-collapsed-bar .bar-count {
+  font-size: 10px;
+  color: #606060;
+  font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
+}
+
+.relations-panel-content {
+  display: none;
+  padding: 12px 20px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.relations-panel.open .relations-panel-content {
+  display: block;
+}
+
+/* ── Relations Toggle Button ── */
+.relations-toggle {
+  transition: color 0.15s;
+}
+.relations-toggle.active {
+  color: #D97757;
+}
+
+/* ── Toolbar ── */
+.relations-toolbar {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+  padding: 8px 12px;
+  background: #252526;
+  border: 1px solid #2d2d2d;
+  border-radius: 6px;
+  margin-bottom: 10px;
+}
+
+.relations-toolbar-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  color: #858585;
+  letter-spacing: 0.5px;
+  font-weight: 600;
+  margin-right: 4px;
+}
+
+.relations-toolbar-sep {
+  width: 1px;
+  height: 18px;
+  background: #3c3c3c;
+  margin: 0 6px;
+}
+
+/* ── Filter Buttons ── */
+.relations-filter-btn {
+  padding: 3px 10px;
+  border: 1px solid #3c3c3c;
+  border-radius: 4px;
+  background: transparent;
+  color: #a0a0a0;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.relations-filter-btn:hover {
+  background: rgba(217, 119, 87, 0.12);
+  border-color: #D97757;
+  color: #e0e0e0;
+}
+.relations-filter-btn.active {
+  background: rgba(217, 119, 87, 0.2);
+  border-color: #D97757;
+  color: #D97757;
+  font-weight: 600;
+}
+
+/* ── Layout Direction Toggle ── */
+.relations-layout-btn {
+  padding: 3px 10px;
+  border: 1px solid #3c3c3c;
+  border-radius: 4px;
+  background: transparent;
+  color: #a0a0a0;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
+}
+.relations-layout-btn:hover {
+  background: rgba(86, 156, 214, 0.12);
+  border-color: #569cd6;
+  color: #e0e0e0;
+}
+.relations-layout-btn.active {
+  background: rgba(86, 156, 214, 0.2);
+  border-color: #569cd6;
+  color: #7bb8e8;
+  font-weight: 600;
+}
+
+/* ── Isolated Nodes Toggle ── */
+.relations-isolated-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  color: #858585;
+  font-size: 11px;
+  user-select: none;
+}
+.relations-isolated-toggle input[type="checkbox"] {
+  accent-color: #D97757;
+  cursor: pointer;
+  width: 13px;
+  height: 13px;
+}
+.relations-isolated-toggle:hover {
+  color: #a0a0a0;
+}
+
+/* ── Collapse Button ── */
+.relations-collapse-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid #3c3c3c;
+  border-radius: 4px;
+  background: transparent;
+  color: #858585;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.relations-collapse-btn:hover {
+  background: rgba(217, 119, 87, 0.12);
+  border-color: #D97757;
+  color: #D97757;
+}
+
+/* ── Graph Container ── */
+.relations-graph-container {
+  background: #252526;
+  border: 1px solid #2d2d2d;
+  border-radius: 6px;
+  padding: 16px;
+  overflow: auto;
+  min-height: 120px;
+  max-height: 320px;
+}
+
+.relations-graph-container svg {
+  display: block;
+  max-width: none;
+  overflow: visible;
+}
+
+/* Mermaid node hover effect */
+.relations-graph-container .node {
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.relations-graph-container .node:hover {
+  opacity: 0.8;
+}
+
+/* ── Legend (inline, compact) ── */
+.relations-legend {
+  display: flex;
+  flex-direction: row;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  background: #252526;
+  border: 1px solid #2d2d2d;
+  border-radius: 6px;
+  margin-top: 10px;
+  flex-shrink: 0;
+}
+
+.relations-legend-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  color: #858585;
+  letter-spacing: 0.5px;
+  font-weight: 600;
+  align-self: center;
+  margin-right: 4px;
+}
+
+.relations-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #a0a0a0;
+}
+
+/* Legend edge SVG — color 는 currentColor 로 주입, 크기는 SVG 자체에서 지정 */
+.relations-legend-edge {
+  display: inline-block;
+  vertical-align: middle;
+}
+.relations-legend-edge.edge-depends { color: #4ec9b0; }
+.relations-legend-edge.edge-derived { color: #dcdcaa; }
+.relations-legend-edge.edge-blocks  { color: #f44747; }
+
+.relations-legend-sep {
+  width: 1px;
+  height: 16px;
+  background: #3c3c3c;
+  align-self: center;
+}
+
+/* Node status colors in legend */
+.relations-legend-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  border: 2px solid currentColor;
+  background: #1e1e1e;
+}
+.relations-legend-dot.dot-open     { color: #4ec9b0; }
+.relations-legend-dot.dot-progress { color: #dcdcaa; }
+.relations-legend-dot.dot-review   { color: #c586c0; }
+.relations-legend-dot.dot-done     { color: #858585; }
+
+/* ── Empty State ── */
+.relations-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 30px 24px;
+  color: #858585;
+  text-align: center;
+}
+
+.relations-empty-icon {
+  display: inline-flex;
+  color: #858585;
+  opacity: 0.4;
+}
+.relations-empty-icon svg {
+  display: block;
+}
+
+.relations-empty-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #5a5a5a;
+}
+
+.relations-empty-desc {
+  font-size: 12px;
+  color: #4a4a4a;
+  max-width: 400px;
+  line-height: 1.5;
+}
+
+.relations-empty-hint {
+  font-size: 11px;
+  font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
+  background: #252526;
+  border: 1px solid #2d2d2d;
+  border-radius: 4px;
+  padding: 4px 10px;
+  color: #858585;
+}
+
+/* ── Loading State ── */
+.relations-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 30px 24px;
+  color: #858585;
+  font-size: 12px;
+}
+
+.relations-loading-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid #3c3c3c;
+  border-top-color: #D97757;
+  border-radius: 50%;
+  animation: relations-spin 0.8s linear infinite;
+}
+
+@keyframes relations-spin {
+  to { transform: rotate(360deg); }
+}
