@@ -174,10 +174,12 @@
   M.renderHistory = function(events) {
     if (!M.outputDiv || !events || !events.length) return;
     var sawInFlight = false;
+
     for (var i = 0; i < events.length; i++) {
       var ev = events[i];
       var kind = ev.kind || "text";
       if (ev.in_flight) sawInFlight = true;
+
       // in_flight 이벤트는 Claude CLI 가 jsonl 에 아직 flush 하지 못한
       // "현재 스트리밍 중인 블록" 이다. 완성된 블록처럼 DOM 에 추가하면
       // 이어지는 라이브 text_delta 가 별개 블록을 만들어 응답이 두 조각으로
@@ -213,8 +215,14 @@
         var text = ev.text || "";
         if (!text) continue;
         if (ev.role === "user") {
+          // 1:1 turn 모델: user 메시지는 항상 outputDiv 직접 자식으로 append.
+          // turn-card user-group 라우팅 폐기.
           var userDiv = document.createElement("div");
           userDiv.className = "term-message term-user";
+          if (ev.timestamp) userDiv.setAttribute("data-timestamp", ev.timestamp);
+          // 서버 history 핸들러가 sidecar 매칭 후 interrupted=true 를 부여한
+          // user 이벤트는 .interrupted 클래스를 부여한다 (CSS 가 우측 "중지됨" 배지 표시).
+          if (ev.interrupted) userDiv.classList.add("interrupted");
           userDiv.textContent = text;
           M.appendToOutput(userDiv);
         } else if (ev.role === "assistant") {
@@ -229,9 +237,11 @@
         _renderToolResult(ev);
       }
     }
+
     // in_flight 이벤트를 만났다는 것은 LLM 이 현재 스트리밍 중이라는 뜻.
     // 새로고침으로 페이지가 재구성된 상태이므로 스피너를 복구하고 termStatus
     // 를 busy 로 올려 입력 잠금 등 관련 UI 를 재개한다.
+    // pending_turn 분기(loadHistory 내부)도 동일하게 spinner 복원을 담당한다.
     if (sawInFlight && !M.isWorkflowMode) {
       if (Board.debugLog) Board.debugLog('renderHistory.inFlightDetected', {
         events: events.length, termStatus: Board.state.termStatus,
@@ -308,6 +318,13 @@
       }
       M.renderHistory(data.events);
       M._historyLastTimestamp = data.last_timestamp || "";
+      // pending_turn: 마지막 user 이벤트 직후 응답 대기 중이나 아직 in_flight 없음.
+      // turn-card 를 닫지 않고 spinner 를 활성화한다.
+      // (in_flight 이 있는 경우는 renderHistory 내부의 sawInFlight 분기가 처리)
+      if (data.pending_turn && !M.isWorkflowMode) {
+        Board.state.setTermStatus("busy");
+        if (M.startSpinner) M.startSpinner();
+      }
       _scrollOutputToBottomSoon();
     }).catch(function () {
       // 네트워크 오류 등: 최소한 placeholder라도 보이게
@@ -371,6 +388,7 @@
 
     var follow = M.isNearBottom(M.outputDiv);
 
+    // 모든 element 는 outputDiv 직접 자식으로 append (turn-card 그룹화 폐기).
     while (M.outputDiv.childNodes.length >= MAX_OUTPUT_NODES) {
       M.outputDiv.removeChild(M.outputDiv.firstChild);
     }

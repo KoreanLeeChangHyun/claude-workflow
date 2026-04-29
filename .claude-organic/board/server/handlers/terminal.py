@@ -22,6 +22,50 @@ _HISTORY_SKIP_TYPES = frozenset({
 })
 
 
+def _assign_turn_ids(events: list[dict]) -> list[dict]:
+    """시간순 render events 배열에 turn_id 필드를 부여하고 그대로 반환한다.
+
+    1:1 단순화 규칙 (1 user 이벤트 = 1 turn):
+    - user 이벤트가 등장할 때마다 무조건 새 turn_id 를 시작한다.
+      timestamp 인접성(gap 임계값) / turn_has_assistant 분기는 폐기.
+    - tool_result 는 user 역할이지만 assistant turn 의 일부로 취급하여
+      새 turn 을 시작하지 않는다.
+    - assistant/tool 이벤트는 직전 user turn_id 를 그대로 상속한다.
+    - turn_id 형식: f"hist-{ev_timestamp}" — user 이벤트 timestamp 기반
+      결정론적 ID. 새로고침 후에도 동일 이벤트가 동일 id 를 받는다.
+
+    orphan 처리:
+    - 첫 이벤트가 assistant 인 엣지 케이스에서는 'hist-orphan' 을 할당한다.
+
+    side-effect: 각 ev dict 에 'turn_id' 키가 추가된다 (in-place).
+    반환값은 편의를 위해 동일 리스트를 그대로 반환한다.
+    """
+    current_turn_id: str | None = None
+
+    for ev in events:
+        role = ev.get('role', '')
+        kind = ev.get('kind', '')
+        ts = ev.get('timestamp', '') or ''
+
+        # tool_result 는 user 역할이지만 assistant turn 의 일부로 취급
+        is_tool_result = (role == 'user' and kind == 'tool_result')
+        is_real_user = (role == 'user' and not is_tool_result)
+
+        if is_real_user:
+            # 새 user 이벤트 = 무조건 새 turn (gap 임계값 무관)
+            # timestamp 없는 레거시 레코드는 극히 드물지만 fallback 처리
+            current_turn_id = f"hist-{ts}" if ts else f"hist-orphan"
+
+        # current_turn_id 가 없으면 fallback: orphan assistant 이벤트
+        # (첫 이벤트가 assistant 인 엣지 케이스)
+        if current_turn_id is None:
+            current_turn_id = 'hist-orphan'
+
+        ev['turn_id'] = current_turn_id
+
+    return events
+
+
 def _extract_tool_result_text(content: object) -> str:
     """tool_result content에서 평문 텍스트만 추출한다.
 
@@ -553,6 +597,65 @@ class TerminalHandlerMixin:
                             if ts and ts > last_timestamp:
                                 last_timestamp = ts
 
+        # SDK 가 ESC 인터럽트 시 jsonl 에 자동으로 추가하는 placeholder user 메시지
+        # "[Request interrupted by user]" 는 사용자가 보낸 메시지가 아니므로 events
+        # 에서 필터링한다. 같은 정보는 sidecar 매칭으로 우리 .interrupted 배지가
+        # 표시하므로 노이즈 발생을 방지한다.
+        events = [
+            ev for ev in events
+            if not (
+                ev.get('role') == 'user'
+                and ev.get('kind') == 'text'
+                and (ev.get('text') or '').strip() == '[Request interrupted by user]'
+            )
+        ]
+
+        # turn_id 그룹화: 모든 events(in-flight 포함)에 turn_id 필드 부여
+        _assign_turn_ids(events)
+
+        # ESC 인터럽트 sidecar 적용: <session_id>.interrupted.jsonl 의 timestamp
+        # 와 일치하는 user 이벤트에 ``interrupted=true`` 필드를 추가한다.
+        # tool_result 는 user role 이지만 인터럽트 대상 아님 (제외).
+        sidecar_path = filepath.replace('.jsonl', '.interrupted.jsonl')
+        if os.path.isfile(sidecar_path):
+            interrupted_ts: set[str] = set()
+            try:
+                with open(sidecar_path, 'r', encoding='utf-8') as fp:
+                    for line in fp:
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        try:
+                            rec = json.loads(stripped)
+                        except (ValueError, json.JSONDecodeError):
+                            continue
+                        ts = rec.get('timestamp')
+                        if isinstance(ts, str) and ts:
+                            interrupted_ts.add(ts)
+            except OSError:
+                interrupted_ts = set()
+            if interrupted_ts:
+                for ev in events:
+                    if ev.get('role') != 'user':
+                        continue
+                    if ev.get('kind') == 'tool_result':
+                        continue
+                    if ev.get('timestamp') in interrupted_ts:
+                        ev['interrupted'] = True
+
+        # pending_turn 플래그: 마지막 user 이벤트 직후 응답 대기 중인 경우
+        # 클라이언트가 turn-card 를 닫지 않고 spinner 를 시드하도록 알린다.
+        # in_flight 이벤트가 이미 있는 경우는 클라이언트가 renderHistory 에서
+        # sawInFlight 로 처리하므로 pending_turn 은 in_flight 없는 경우 보완책.
+        pending_turn = False
+        if claude_process.session_id == session_id:
+            if getattr(claude_process, '_awaiting_response', False):
+                # 마지막 이벤트가 user 이고 in_flight 이벤트가 없는 경우
+                if events and not events[-1].get('in_flight'):
+                    last_ev = events[-1]
+                    if last_ev.get('role') == 'user' and last_ev.get('kind') != 'tool_result':
+                        pending_turn = True
+
         response: dict = {
             'session_id': session_id,
             'last_timestamp': last_timestamp,
@@ -564,6 +667,8 @@ class TerminalHandlerMixin:
             response['last_cost_usd'] = last_cost_usd
         if last_model is not None:
             response['last_model'] = last_model
+        if pending_turn:
+            response['pending_turn'] = True
 
         self._send_json(response)
 
@@ -759,6 +864,13 @@ class TerminalHandlerMixin:
 
         POST /terminal/interrupt: Claude CLI 프로세스에 SIGINT를 전송한다.
         프로세스를 종료하지 않고 현재 응답 생성만 중단한다.
+
+        세션 보존 보장:
+        - 이 엔드포인트는 ``claude_process.interrupt()`` 호출만 수행한다.
+        - ``claude_process._status``, ``claude_process._session_id``,
+          conversation history 등 세션 식별자나 상태 필드를 변경하지 않는다.
+        - 따라서 SIGINT 이후 클라이언트가 새로고침해도 conversation history 를
+          jsonl 에서 그대로 복원할 수 있다.
 
         프로세스가 stopped 상태이면 409 Conflict를 반환한다.
         """
