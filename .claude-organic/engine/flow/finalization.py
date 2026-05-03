@@ -59,6 +59,7 @@ UPDATE_STATE: str = os.path.join(PROJECT_ROOT, ".claude-organic", "engine", "flo
 USAGE_SYNC: str = os.path.join(PROJECT_ROOT, ".claude-organic", "engine", "sync", "usage_sync.py")
 KANBAN_PY: str = os.path.join(PROJECT_ROOT, ".claude-organic", "engine", "flow", "kanban.py")
 CHAIN_LAUNCHER: str = os.path.join(PROJECT_ROOT, ".claude-organic", "engine", "flow", "chain_launcher.py")
+CHAIN_LAUNCH_WRAPPER: str = os.path.join(PROJECT_ROOT, ".claude-organic", "bin", "flow-chain-launch")
 
 
 def run(
@@ -719,7 +720,9 @@ def _update_task_stats(registry_key: str, abs_work_dir: str) -> None:
         pass
 
 
-def _build_result_update_args(abs_work_dir: str) -> list[str]:
+def _build_result_update_args(
+    abs_work_dir: str, registry_key: str | None = None,
+) -> list[str]:
     """update-result CLI 추가 인자 리스트를 반환한다.
 
     abs_work_dir에서 registryKey를 추출하고, plan.md / report.md 존재 여부를
@@ -728,22 +731,23 @@ def _build_result_update_args(abs_work_dir: str) -> list[str]:
     Args:
         abs_work_dir: 워크플로우 작업 디렉터리 절대 경로
             (.workflow/{registryKey}/{workName}/{command} 구조)
+        registry_key: 호출자(main)가 인자로 받은 registry_key. 명시 전달 시
+            abs_work_dir 정규식 추출 실패에 의존하지 않는다 (2026-04-29 보완).
 
     Returns:
         ["--registrykey", registryKey, "--workdir", workDir상대경로] 에
         plan.md / report.md가 존재하면 각각 "--plan" / "--report" 인자를 추가한 리스트.
-        registryKey 추출 실패 시 빈 리스트.
+        registryKey 추출과 workdir 매칭 모두 실패하면 빈 리스트.
     """
     import re as _re
 
-    # abs_work_dir 에서 YYYYMMDD-HHMMSS 패턴 추출
-    # 경로 형식: .../.claude-organic/runs/{registryKey}/{workName}/{command}
-    _ts_pattern = _re.compile(r"\.claude-organic[/\\]runs[/\\](\d{8}-\d{6}(?:-\d+)?)")
-    _match = _ts_pattern.search(abs_work_dir)
-    if not _match:
-        return []
-
-    registry_key: str = _match.group(1)
+    # registry_key 우선순위: 1) 인자로 받은 명시 값, 2) abs_work_dir 정규식 추출
+    if not registry_key:
+        _ts_pattern = _re.compile(r"\.claude-organic[/\\]runs[/\\](\d{8}-\d{6}(?:-\d+)?)")
+        _match = _ts_pattern.search(abs_work_dir)
+        if not _match:
+            return []
+        registry_key = _match.group(1)
 
     # 상대 workDir: .claude-organic/runs/{registryKey}/... 이후 부분을 포함한 경로
     _wf_idx = abs_work_dir.find(".claude-organic/runs/")
@@ -833,7 +837,11 @@ def main() -> None:
         )
     else:
         if abs_work_dir is not None:
-            _append_log(abs_work_dir, "WARN", "FINALIZE_STEP2A: transcript=not_found")
+            # status=완료 인데 transcript 가 없으면 비정상 (사용량 집계 누락) → WARN 유지.
+            # status=실패 / 짧은 디버그 워크플로우는 transcript 미생성이 정상이므로 INFO 로 강등 —
+            # 로그 분석 (2026-04-29) 에서 102회 누적된 노이즈를 정상/비정상으로 분리한다.
+            _level = "WARN" if status == "완료" else "INFO"
+            _append_log(abs_work_dir, _level, "FINALIZE_STEP2A: transcript=not_found")
 
     # Step 2b: usage-finalize
     if abs_work_dir is not None:
@@ -910,7 +918,9 @@ def main() -> None:
 
         # ── Step 4b: 결과 워크플로우 번호 기록 (완료 시만, 비차단) ──
         if status == "완료" and abs_work_dir is not None:
-            update_args = _build_result_update_args(abs_work_dir)
+            # registry_key 명시 전달로 정규식 매치 실패 케이스 차단 (2026-04-29 보완,
+            # "no workflow number" WARN 21회 누적된 회귀 해결).
+            update_args = _build_result_update_args(abs_work_dir, registry_key=registry_key)
             if not update_args:
                 _append_log(abs_work_dir, "WARN", f"FINALIZE_STEP4B: no workflow number in status.json ticket={ticket_number}, skipping result update")
             else:
@@ -944,6 +954,55 @@ def main() -> None:
                 )
         except Exception:
             pass  # worktree 메타데이터 읽기 실패는 무시
+
+    # ── Step 4wt-fb: 비-worktree 모드 originalBranch 복귀 훅 (T-370 C-2) ──
+    # WORKFLOW_WORKTREE=false 또는 worktree 생성 실패로 비-worktree 모드인 경우,
+    # 세션 종료 시 originalBranch로 메인 저장소 HEAD를 복귀시킨다.
+    # 복귀 실패는 raise하지 않고 WARN 로그만 남긴다 (finalization 흐름 비차단).
+    if abs_work_dir is not None:
+        try:
+            context_file_fb: str = os.path.join(abs_work_dir, ".context.json")
+            context_fb = load_json_file(context_file_fb)
+            if isinstance(context_fb, dict):
+                wt_enabled_fb: bool = bool(
+                    context_fb.get("worktree", {}).get("enabled", False)
+                )
+                original_branch_fb: str = context_fb.get("originalBranch", "")
+                if not wt_enabled_fb and original_branch_fb:
+                    restore = subprocess.run(
+                        ["git", "checkout", original_branch_fb],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if restore.returncode == 0:
+                        _append_log(
+                            abs_work_dir,
+                            "INFO",
+                            f"FINALIZE_BRANCH_RESTORE: HEAD -> {original_branch_fb}",
+                        )
+                    else:
+                        _append_log(
+                            abs_work_dir,
+                            "WARN",
+                            (
+                                f"FINALIZE_BRANCH_RESTORE: failed "
+                                f"(originalBranch={original_branch_fb}, "
+                                f"stderr={restore.stderr.strip()})"
+                            ),
+                        )
+                        print(
+                            f"[WARN] 브랜치 복귀 실패: {original_branch_fb} "
+                            f"(stderr={restore.stderr.strip()})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+        except Exception as restore_exc:
+            _append_log(
+                abs_work_dir,
+                "WARN",
+                f"FINALIZE_BRANCH_RESTORE: exception {restore_exc}",
+            )
 
     # ── Step 4c: 체인 감지 및 다음 스테이지 발사 (비동기) ──
     # .context.json의 command에 ">" 구분자가 포함되면 체인으로 판별한다.
@@ -992,7 +1051,9 @@ def main() -> None:
                     _append_log(abs_work_dir, "WARN", f"FINALIZE_CHAIN: report.md not found at {report_path}, using workdir as fallback")
                     report_path = abs_work_dir
 
-                if os.path.isfile(CHAIN_LAUNCHER):
+                # bin wrapper 우선 (engine 직접 경로 의존 제거 — engine 역할 매핑
+                # 분석 P2-3, 2026-04-29). wrapper 가 없으면 engine 스크립트로 폴백.
+                if os.path.isfile(CHAIN_LAUNCH_WRAPPER) or os.path.isfile(CHAIN_LAUNCHER):
                     _append_log(
                         abs_work_dir,
                         "INFO",
@@ -1004,14 +1065,23 @@ def main() -> None:
                             _chain_log_fh = open(_chain_log_path, "a", encoding="utf-8")
                         except Exception:
                             _chain_log_fh = subprocess.DEVNULL  # type: ignore[assignment]
-                        subprocess.Popen(
-                            [
+                        if os.path.isfile(CHAIN_LAUNCH_WRAPPER):
+                            _chain_cmd = [
+                                CHAIN_LAUNCH_WRAPPER,
+                                ticket_number,
+                                remaining_chain,
+                                report_path,
+                            ]
+                        else:
+                            _chain_cmd = [
                                 "python3",
                                 CHAIN_LAUNCHER,
                                 ticket_number,
                                 remaining_chain,
                                 report_path,
-                            ],
+                            ]
+                        subprocess.Popen(
+                            _chain_cmd,
                             stdout=subprocess.DEVNULL,
                             stderr=_chain_log_fh,
                             start_new_session=True,
@@ -1025,8 +1095,8 @@ def main() -> None:
                         print(f"  수동으로 다음 스테이지를 시작하려면: /wf -s {_ticket_num_str}", file=sys.stderr)
                         print(f"  남은 체인: {remaining_chain}", file=sys.stderr)
                 else:
-                    _append_log(abs_work_dir, "WARN", f"FINALIZE_CHAIN: chain_launcher.py not found at {CHAIN_LAUNCHER}")
-                    print(f"[WARN] Step 4c: chain_launcher.py not found: {CHAIN_LAUNCHER}", file=sys.stderr)
+                    _append_log(abs_work_dir, "WARN", f"FINALIZE_CHAIN: chain launcher not found (wrapper={CHAIN_LAUNCH_WRAPPER}, engine={CHAIN_LAUNCHER})")
+                    print(f"[WARN] Step 4c: chain launcher not found (wrapper={CHAIN_LAUNCH_WRAPPER}, engine={CHAIN_LAUNCHER})", file=sys.stderr)
             else:
                 if abs_work_dir is not None:
                     _append_log(abs_work_dir, "INFO", "FINALIZE_CHAIN: chain complete (no remaining segments)")
