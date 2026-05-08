@@ -179,6 +179,13 @@
   min-width: 0;
 }
 
+.card-top-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
 .card-mid {
   flex: 1;
   min-height: 0;
@@ -248,6 +255,30 @@
 .status-open {
   background: rgba(78, 201, 176, 0.15);
   color: #4ec9b0;
+}
+
+.card-uncommitted-badge {
+  font-size: 9px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 3px;
+  white-space: nowrap;
+  background: rgba(217, 119, 87, 0.20);
+  color: #D97757;
+  border: 1px solid rgba(217, 119, 87, 0.45);
+  cursor: pointer;
+  font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.card-uncommitted-badge:hover {
+  background: rgba(217, 119, 87, 0.35);
+  border-color: #D97757;
+}
+
+.card-uncommitted-badge.is-commiting {
+  opacity: 0.6;
+  cursor: wait;
 }
 
 /* T-399: .status-submit 룰 제거됨 (Submit transient 단계 제거). */
@@ -407,6 +438,14 @@
   box-shadow: inset 0 0 0 1px rgba(217, 119, 87, 0.3);
 }
 
+/* T-906: Done drop hover — 비가역 처리 의식 강조 (box-shadow 강화) */
+.cards-droppable[data-col-key="Done"].dragover-active {
+  background: rgba(217, 119, 87, 0.16);
+  outline: 2px dashed #D97757;
+  outline-offset: -4px;
+  box-shadow: inset 0 0 0 1px rgba(217, 119, 87, 0.45);
+}
+
 /* T-399: confirm 모달 (Open → In Progress drop) */
 .submit-confirm-overlay {
   position: fixed;
@@ -442,6 +481,17 @@
   font-size: 13px;
   line-height: 1.55;
   color: #cccccc;
+}
+
+/* T-906: 결과 모달 내 충돌/미커밋 파일 목록 스타일 */
+.submit-confirm-body ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+}
+
+.submit-confirm-body ul li {
+  margin: 3px 0;
+  color: #f48771;
 }
 
 .submit-confirm-actions {

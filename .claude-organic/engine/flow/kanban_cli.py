@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -51,45 +52,22 @@ from common import resolve_project_root
 _SCRIPT_DIR: str = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT: str = resolve_project_root()
 
+# ─── 병합 충돌 시그널 패턴 ────────────────────────────────────────────────────
 
-# ─── 디버그 슬롯 정책 ─────────────────────────────────────────────────────────
-# T-900~T-999 는 디버그/일회성 검증용 예약 영역. 자동 채번에서 제외되며,
-# `--debug` 플래그 또는 `--number 9XX` 명시 호출로만 사용한다.
-_DEBUG_RANGE_START: int = 900
-_DEBUG_RANGE_END: int = 999
-_DEBUG_TEMPLATE_PATH: str = os.path.join(
-    _PROJECT_ROOT, ".claude-organic", "templates", "debug-ticket.json"
+_CONFLICT_SIGNAL_RE: re.Pattern[str] = re.compile(
+    r"(병합\s*충돌|merge\s+conflict|CONFLICT)",
+    re.IGNORECASE,
 )
+"""merge_result.error_message 에서 충돌 신호를 감지하기 위한 정규식.
 
+W05 테스트에서 ``from flow.kanban_cli import _CONFLICT_SIGNAL_RE`` 로 직접 import
+가능하도록 모듈 레벨에 노출한다.
 
-def _get_next_debug_slot() -> "str | None":
-    """T-900~T-999 영역에서 비어있는 첫 슬롯 번호를 반환한다.
-
-    모든 디버그 슬롯이 사용 중이면 None을 반환한다.
-
-    Returns:
-        T-NNN 형식 문자열 또는 None.
-    """
-    for num in range(_DEBUG_RANGE_START, _DEBUG_RANGE_END + 1):
-        candidate = f"T-{num:03d}"
-        if find_ticket_file(candidate) is None:
-            return candidate
-    return None
-
-
-def _load_debug_template() -> dict:
-    """디버그 티켓 템플릿 JSON을 로드한다.
-
-    파일이 없거나 파싱 실패 시 비어있는 dict를 반환하여 호출 측이 폴백할 수 있게 한다.
-
-    Returns:
-        템플릿 dict (title_prefix, command, prompt 키 포함 가능).
-    """
-    try:
-        with open(_DEBUG_TEMPLATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
+매칭 패턴:
+- ``병합 충돌`` / ``병합충돌`` (한국어, 공백 선택적)
+- ``merge conflict`` / ``Merge Conflict`` 등 (대소문자 무관)
+- ``CONFLICT`` (git stdout 접두사 형식)
+"""
 
 
 # ─── 세션 헬퍼 ───────────────────────────────────────────────────────────────
@@ -226,6 +204,9 @@ def _cleanup_worktree_on_leave(ticket_number: str) -> None:
     """In Progress에서 이탈할 때 연결된 워크트리를 자동 정리한다.
 
     워크트리 비활성 환경이거나 해당 티켓의 워크트리가 없으면 조용히 건너뛴다.
+    미커밋 변경이 있는 경우 데이터 손실을 막기 위해 정리를 skip 하고
+    사용자에게 경로를 명시한다 (T-411: 워커 commit 누락 / finalization 실패 시
+    워크트리 자동 삭제로 인한 작업물 영구 손실 차단).
     정리 실패 시 경고만 출력하고 예외를 전파하지 않는다 (상태 전이 차단 금지).
 
     Args:
@@ -235,6 +216,7 @@ def _cleanup_worktree_on_leave(ticket_number: str) -> None:
         from flow.worktree_manager import (
             is_worktree_enabled,
             get_worktree_path,
+            has_uncommitted_changes,
             remove_worktree,
         )
 
@@ -243,6 +225,23 @@ def _cleanup_worktree_on_leave(ticket_number: str) -> None:
 
         wt_path = get_worktree_path(ticket_number)
         if not wt_path:
+            return
+
+        if has_uncommitted_changes(wt_path):
+            log(
+                "WARN",
+                f"kanban.py: worktree 정리 skip — 미커밋 변경 보존 ({ticket_number}, path={wt_path})",
+            )
+            print(
+                f"[WARN] {ticket_number} 워크트리에 미커밋 변경 있음 — 자동 정리 skip",
+                flush=True,
+            )
+            print(f"[WARN] 경로: {wt_path}", flush=True)
+            print(
+                "[WARN] 검토 후 수동으로 commit / 폐기: "
+                f"`git -C {wt_path} status`",
+                flush=True,
+            )
             return
 
         success = remove_worktree(ticket_number, delete_branch=True)
@@ -264,14 +263,11 @@ def cmd_create(
     command: str,
     status: str,
     number: str | None = None,
-    debug: bool = False,
 ) -> None:
     """새 티켓 XML을 생성한다.
 
     번호 미지정 시 XML 파일명에서 최대 T-NNN 번호를 스캔하여 +1 자동 채번한다.
     번호 명시 시 정규화 후 동일 번호 충돌을 검사하고, 존재하면 에러로 거부한다.
-    debug=True 면 T-900~T-999 영역의 빈 슬롯을 자동 배정하고 디버그 템플릿을 적용한다.
-    자동 채번은 T-899 까지만 사용한다 (T-900~T-999 는 디버그 전용 예약 영역).
     status 값에 따라 .kanban/todo/ 또는 .kanban/open/ 아래에 T-NNN.xml 파일을 생성한다.
 
     Args:
@@ -279,7 +275,6 @@ def cmd_create(
         command: 워크플로우 커맨드 (implement, review, research 등). 현재 미사용 (하위 호환용).
         status: 초기 상태 키 ("todo" | "open"). COLUMN_MAP을 통해 XML <status> 값으로 변환된다.
         number: 명시적 티켓 번호 (T-NNN, NNN, #N 형식). 미지정 시 자동 채번.
-        debug: True 이면 디버그 슬롯 자동 배정 및 템플릿 적용. number 와 동시 사용 불가.
     """
     # status 키를 상태명("To Do" / "Open")으로 변환
     status_label = COLUMN_MAP.get(status)
@@ -289,29 +284,6 @@ def cmd_create(
             f"(예: flow-kanban create \"제목\" --command implement --status todo)",
             2,
         )
-
-    # --debug 와 --number 동시 사용 차단
-    if debug and number is not None:
-        err("--debug 와 --number 는 동시 사용할 수 없습니다. 둘 중 하나만 지정하세요.", 2)
-
-    # --debug 처리: 슬롯 자동 배정 + 템플릿 로드
-    debug_template: dict = {}
-    if debug:
-        slot = _get_next_debug_slot()
-        if slot is None:
-            err(
-                f"디버그 슬롯 소진: T-{_DEBUG_RANGE_START}~T-{_DEBUG_RANGE_END} 모두 사용 중입니다. "
-                f"기존 디버그 티켓을 정리한 후 다시 시도하세요.",
-                2,
-            )
-        number = slot
-        debug_template = _load_debug_template()
-        # 템플릿의 title_prefix / command 적용 (사용자 명시 우선)
-        prefix = debug_template.get("title_prefix", "")
-        if prefix and not title.startswith(prefix.strip()):
-            title = f"{prefix}{title}"
-        if not command and debug_template.get("command"):
-            command = debug_template["command"]
 
     # 대상 디렉터리 결정
     target_dir = KANBAN_TODO_DIR if status == "todo" else KANBAN_OPEN_DIR
@@ -332,15 +304,11 @@ def cmd_create(
                 2,
             )
     else:
-        max_num = get_max_ticket_number()
+        # 디버그 영역(900-999) 자동 부여 차단 — 2026-05-05 폐지 (workflow.md 번호 영역 정책 / 메모리 룰).
+        # 기존 활성 잔존(T-900/T-901/T-903 등) 보존하되 max 계산에서만 배제하여 자동 채번 잠식 차단.
+        # 명시 `--number` 호출은 위 if 분기에서 처리되므로 영향 없음.
+        max_num = get_max_ticket_number(exclude_debug_range=True)
         new_num = max_num + 1
-        # 디버그 영역 진입 차단: 자동 채번이 T-900 에 도달하면 에러로 정책을 알린다.
-        if new_num >= _DEBUG_RANGE_START:
-            err(
-                f"자동 채번이 디버그 영역(T-{_DEBUG_RANGE_START}~T-{_DEBUG_RANGE_END}) 에 도달했습니다. "
-                f"--number 로 일반 영역 번호를 명시하거나, 디버그 슬롯을 정리하세요.",
-                2,
-            )
         ticket_number = f"T-{new_num:03d}"
 
     # 파일명: T-NNN.xml 고정
@@ -364,19 +332,6 @@ def cmd_create(
             f.write("\n")
     except OSError as e:
         err(f"티켓 파일 생성 실패: {e}")
-
-    # --debug 시 템플릿의 prompt 필드를 즉시 시딩한다 (사용자가 update-prompt 로 갈아끼우기 쉽게 placeholder 제공).
-    if debug:
-        prompt_defaults = debug_template.get("prompt", {}) or {}
-        if prompt_defaults:
-            try:
-                update_prompt(
-                    ticket_file,
-                    {k: v for k, v in prompt_defaults.items() if v},
-                )
-            except Exception as exc:
-                # 템플릿 시딩 실패는 티켓 생성 자체를 막지 않는다 (경고만 남긴다).
-                print(f"[WARN] 디버그 템플릿 시딩 실패: {exc}", flush=True)
 
     suffix = f" ({command})" if command else ""
     print(f"{ticket_number}: {title}{suffix} [{status_label}]")
@@ -521,26 +476,59 @@ def cmd_done(ticket_number: str) -> None:
                 print(f"[ERROR] 미커밋 변경이 있는 워크트리입니다. Done 전이를 차단합니다.", flush=True)
                 print(f"  미커밋 파일 목록:", flush=True)
                 for _line in _porcelain.stdout.strip().splitlines():
-                    print(f"    {_line}", flush=True)
+                    print(f"    - {_line.strip()}", flush=True)
                 print(f"  flow-merge를 사용하여 정상 경로로 완료하세요.", flush=True)
                 _sys.exit(1)
             feat_branch = get_feature_branch_for_ticket(ticket_number)
             if _wt_path or feat_branch:
                 merge_result = merge_to_develop(ticket_number)
                 if not merge_result.success:
-                    if merge_result.conflicts:
+                    # 충돌 판정 이중화:
+                    # (1) merge_result.conflicts 가 비어있지 않음
+                    # (2) error_message 에 충돌 시그널 패턴 포함
+                    # (3) conflicts 에 sentinel "<unknown-conflict>" 가 있음
+                    # 셋 중 하나라도 만족하면 충돌로 간주하여 Done 전이를 차단한다.
+                    _sentinel = "<unknown-conflict>"
+                    _has_conflict_files = bool(merge_result.conflicts)
+                    _has_signal_in_msg = bool(
+                        _CONFLICT_SIGNAL_RE.search(merge_result.error_message or "")
+                    )
+                    _has_sentinel = _sentinel in (merge_result.conflicts or [])
+                    _is_conflict = _has_conflict_files or _has_signal_in_msg or _has_sentinel
+
+                    if _is_conflict:
                         print(f"[ERROR] {ticket_number} 병합 충돌 발생. Done 전이를 차단합니다.", flush=True)
-                        print(f"  충돌 파일:", flush=True)
-                        for cf in merge_result.conflicts:
-                            print(f"    - {cf}", flush=True)
+                        # 충돌 파일 목록 출력 — sentinel 만 있거나 목록이 빈 경우 안내 메시지로 대체
+                        if merge_result.conflicts and not (
+                            len(merge_result.conflicts) == 1 and merge_result.conflicts[0] == _sentinel
+                        ):
+                            print(f"  충돌 파일:", flush=True)
+                            for cf in merge_result.conflicts:
+                                print(f"    - {cf}", flush=True)
+                        else:
+                            print(
+                                f"  (충돌 파일 목록 미상 — error_message 참조)",
+                                flush=True,
+                            )
+                            if merge_result.error_message:
+                                print(f"  error_message: {merge_result.error_message}", flush=True)
                         print(f"  worktree에서 충돌을 해결한 후 다시 시도하세요.", flush=True)
                         _sys.exit(1)
                     else:
-                        # 충돌 외 실패: 경고 출력 후 계속 진행
+                        # 충돌 패턴 검사 false — 단순 실패(예: develop checkout 실패): 경고 출력 후 계속 진행
                         print(f"[WARN] worktree 병합 실패: {merge_result.error_message}", flush=True)
                 else:
                     print(f"{ticket_number}: {merge_result.merged_branch} -> develop 병합 완료 ({merge_result.merge_commit[:8]})", flush=True)
                     log("INFO", f"kanban.py: worktree merge {merge_result.merged_branch} -> develop ({merge_result.merge_commit[:8]})")
+                    # T-905: merge_commit SHA 를 result 메타에 저장 (Done 롤백 인프라)
+                    if merge_result.merge_commit:
+                        try:
+                            _ticket_file_for_result = find_ticket_file(ticket_number)
+                            if _ticket_file_for_result is not None:
+                                update_result(_ticket_file_for_result, {"merge_commit": merge_result.merge_commit})
+                                log("INFO", f"kanban.py: result.merge_commit 저장 ({merge_result.merge_commit[:8]})")
+                        except Exception as _ur_err:
+                            print(f"[WARN] result.merge_commit 저장 실패 (계속 진행): {_ur_err}", flush=True)
     except ImportError:
         pass  # worktree 모듈 미설치 시 무시 (하위 호환)
     except Exception as _wt_err:
@@ -769,6 +757,7 @@ def cmd_update_result(
     workdir: str = "",
     plan: str = "",
     report: str = "",
+    merge_commit: str = "",
 ) -> None:
     """티켓 XML의 <result> 하위 요소를 갱신한다.
 
@@ -778,6 +767,7 @@ def cmd_update_result(
         workdir: 워크플로우 산출물 디렉터리 상대 경로.
         plan: plan.md 상대 경로.
         report: report.md 상대 경로.
+        merge_commit: feature -> develop 머지 커밋 SHA (40자 hex).
 
     Raises:
         SystemExit: 티켓 파일을 찾을 수 없거나 쓰기 실패 시.
@@ -795,6 +785,8 @@ def cmd_update_result(
         updates["plan"] = plan
     if report:
         updates["report"] = report
+    if merge_commit:
+        updates["merge_commit"] = merge_commit
 
     if not updates:
         err("갱신할 필드가 없습니다.", 2)
@@ -1233,17 +1225,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--number",
         default=None,
         help=(
-            "티켓 번호 명시 (T-NNN, NNN, #N 형식). 미지정 시 자동 채번 (T-899 까지). "
-            "동일 번호 존재 시 에러. T-900~T-999 는 디버그 예약 영역."
-        ),
-    )
-    create_parser.add_argument(
-        "--debug",
-        action="store_true",
-        help=(
-            "디버그 티켓 생성. T-900~T-999 영역의 빈 슬롯을 자동 배정하고 "
-            ".claude-organic/templates/debug-ticket.json 템플릿을 적용한다. "
-            "--number 와 동시 사용 불가."
+            "티켓 번호 명시 (T-NNN, NNN, #N 형식). 미지정 시 자동 채번. "
+            "동일 번호 존재 시 에러."
         ),
     )
 
@@ -1283,6 +1266,7 @@ def build_parser() -> argparse.ArgumentParser:
     update_result_parser.add_argument("--workdir", default="", help="워크플로우 산출물 디렉터리 상대 경로")
     update_result_parser.add_argument("--plan", default="", help="plan.md 상대 경로")
     update_result_parser.add_argument("--report", default="", help="report.md 상대 경로")
+    update_result_parser.add_argument("--merge-commit", dest="merge_commit", default="", help="feature -> develop 머지 커밋 SHA")
 
     # set-editing 서브커맨드
     set_editing_parser = subparsers.add_parser("set-editing", help="티켓 XML의 <editing> 플래그를 설정한다")
@@ -1350,7 +1334,7 @@ def dispatch(args: argparse.Namespace) -> None:
         SystemExit: 잘못된 티켓 번호 또는 서브커맨드 실행 오류 시.
     """
     if args.subcommand == "create":
-        cmd_create(args.title, args.command, args.status, args.number, debug=args.debug)
+        cmd_create(args.title, args.command, args.status, args.number)
 
     elif args.subcommand == "move":
         ticket = normalize_ticket_number(args.ticket)
@@ -1395,6 +1379,7 @@ def dispatch(args: argparse.Namespace) -> None:
             workdir=args.workdir,
             plan=args.plan,
             report=args.report,
+            merge_commit=args.merge_commit,
         )
 
     elif args.subcommand == "set-editing":

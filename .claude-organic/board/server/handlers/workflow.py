@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 import uuid
 
@@ -12,6 +13,18 @@ from .._common import logger
 from ..event_filter import is_user_visible
 from ..terminal_channel import _resolve_last_event_id, TerminalSSEChannel
 from ..claude_process import _validate_images
+
+# engine/ 디렉터리를 sys.path 에 추가하여 `from flow.stop import stop_workflow` 가
+# board/server 환경에서도 동작하도록 한다.
+# 구조: .claude-organic/board/server/handlers/workflow.py
+#        → .claude-organic/board/server/handlers/ (이 파일 위치)
+#        → .claude-organic/engine/                (flow/ 패키지 위치)
+_HANDLERS_DIR = os.path.dirname(os.path.abspath(__file__))
+_ENGINE_DIR = os.path.normpath(
+    os.path.join(_HANDLERS_DIR, '..', '..', '..', 'engine')
+)
+if _ENGINE_DIR not in sys.path:
+    sys.path.insert(0, _ENGINE_DIR)
 
 # REST history 전용 throwaway 채널. _classify_event / _build_payload 는
 # 인스턴스 state 를 사용하지 않으므로 단일 인스턴스 재사용 가능.
@@ -407,6 +420,68 @@ class WorkflowHandlerMixin:
             'events': events,
         })
 
+    def _handle_workflow_stop(self) -> None:
+        """워크플로우를 강제 중지하고 4축(프로세스/jsonl/칸반/워크트리)을 정리한다.
+
+        POST /api/workflow/stop
+        요청 본문: {"ticket": "T-NNN"} 또는 {"session_id": "wf-T-NNN-..."}
+        응답: stop_workflow() 반환 dict 그대로 + HTTP 200/4xx/5xx
+
+        - ticket 또는 session_id 둘 중 하나 필수. 둘 다 없으면 400.
+        - 기존 /terminal/workflow/kill 은 프로세스만 kill; 본 엔드포인트는 4축 통합 정리.
+        - in-process import: from flow.stop import stop_workflow 직접 호출
+          (subprocess 경유 없이 동일 프로세스에서 jsonl/칸반/워크트리 정리).
+        """
+        data = self._read_json_body()
+        if data is None:
+            return
+
+        ticket = data.get('ticket') or None
+        session_id = data.get('session_id') or None
+
+        # ticket 또는 session_id 둘 다 없으면 400
+        if not ticket and not session_id:
+            self._send_error(
+                400,
+                'Missing required field: provide "ticket" (e.g. "T-NNN") '
+                'or "session_id" (e.g. "wf-T-NNN-...")',
+            )
+            return
+
+        # in-process import (engine/ 이 sys.path 에 추가되어 있으므로 동작)
+        try:
+            from flow.stop import stop_workflow  # noqa: E402
+        except ImportError as exc:
+            logger.error('_handle_workflow_stop: flow.stop import 실패: %s', exc)
+            self._send_error(500, f'Internal error: flow.stop import failed — {exc}')
+            return
+
+        try:
+            result = stop_workflow(ticket=ticket, session_id=session_id)
+        except Exception as exc:
+            logger.error('_handle_workflow_stop: stop_workflow 예외: %s', exc, exc_info=True)
+            self._send_error(500, f'stop_workflow failed: {exc}')
+            return
+
+        # ok=False 이고 errors 에 "no active session" 포함 → 404
+        errors = result.get('errors') or []
+        no_session = any(
+            'no active session' in e or 'session not found' in e.lower()
+            for e in errors
+        )
+        if not result.get('ok') and no_session:
+            self.send_response(404)
+            body = json.dumps(result, ensure_ascii=False).encode('utf-8')
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # 정상 응답 (ok=True 또는 부분 성공) → 200
+        self._send_json(result)
+
     def _handle_workflow_artifact(self, qs: dict) -> None:
         """워크플로우 산출물 파일 조회 엔드포인트를 처리한다.
 
@@ -488,10 +563,47 @@ class WorkflowHandlerMixin:
             self._send_error(403, 'Path escapes work_dir boundary')
             return
 
-        # 파일 읽기
+        # 파일 읽기 — 1차: work_dir 기준 직접 경로
         if not os.path.isfile(real_candidate):
-            self._send_error(404, f'File not found: {rel_path}')
-            return
+            # 1차 파일 미존재 → .history/ 폴백 시도
+            # work_dir 가 이미 .history/ 를 포함하면 폴백 의미 없음 (skip)
+            _history_candidate = None
+            if '/.history/' not in work_dir:
+                # /runs/<key>/ → /runs/.history/<key>/ 치환
+                archived_work_dir = _re.sub(
+                    r'(/runs/)(?!\.history/)([0-9]{8}-[0-9]{6}/)',
+                    r'\1.history/\2',
+                    work_dir,
+                )
+                # 치환이 실제로 일어났는지 확인 (패턴 불일치 시 동일 문자열 반환)
+                if archived_work_dir != work_dir:
+                    # 화이트리스트 검증은 이미 위에서 통과했으므로 재사용
+                    try:
+                        real_archived_work_dir = os.path.realpath(archived_work_dir)
+                    except (OSError, ValueError):
+                        real_archived_work_dir = None
+
+                    if real_archived_work_dir is not None:
+                        archived_candidate = os.path.join(real_archived_work_dir, rel_path)
+                        try:
+                            real_archived_candidate = os.path.realpath(archived_candidate)
+                        except (OSError, ValueError):
+                            real_archived_candidate = None
+
+                        # prefix 검증 (경로 탈출 방지)
+                        if real_archived_candidate is not None and (
+                            real_archived_candidate.startswith(real_archived_work_dir + os.sep)
+                            or real_archived_candidate == real_archived_work_dir
+                        ):
+                            if os.path.isfile(real_archived_candidate):
+                                _history_candidate = real_archived_candidate
+
+            if _history_candidate is None:
+                self._send_error(404, f'File not found: {rel_path}')
+                return
+
+            # 폴백 경로로 읽기
+            real_candidate = _history_candidate
 
         try:
             with open(real_candidate, encoding='utf-8') as f:

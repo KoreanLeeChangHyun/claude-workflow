@@ -27,9 +27,6 @@ from .._common import (
     _read_roadmap,
     _read_quick_prompts,
     _memory_gc_status,
-    _memory_gc_run,
-    _memory_gc_prune_archive,
-    logger,
 )
 
 
@@ -48,7 +45,7 @@ class GenericHandlerMixin:
             self._send_json(_parse_env_file(project_root))
         elif path == '/api/kanban':
             files_param = qs.get('files', [None])[0]
-            files = files_param.split(',') if files_param else None
+            files = files_param.split(",") if files_param else None
             self._send_json(_read_kanban_tickets(project_root, files))
         elif path == '/api/dashboard':
             self._send_json(_read_dashboard(project_root))
@@ -119,211 +116,57 @@ class GenericHandlerMixin:
             self._send_json(_read_quick_prompts(project_root))
         elif path == '/api/memory/gc/status':
             self._send_json(_memory_gc_status(project_root))
+        elif path.startswith('/api/metrics/run/'):
+            registry_key = path[len('/api/metrics/run/'):].strip('/')
+            self._handle_metrics_run(registry_key)
+        elif path == '/api/metrics/aggregate':
+            last = self._parse_metrics_last(qs, default=20)
+            self._handle_metrics_aggregate(last)
+        elif path == '/api/metrics/regression':
+            last = self._parse_metrics_last(qs, default=20)
+            self._handle_metrics_regression(last)
+        elif path == '/api/worktree/uncommitted/all':
+            self._handle_worktree_uncommitted_all()
         else:
             self.send_response(404)
             self.end_headers()
 
-    # ---------------- Memory GC POST handlers ----------------
-
-    def _handle_memory_gc_run(self) -> None:
-        """POST /api/memory/gc/run — body {"dry_run": bool, "with_reflection": bool}"""
-        data = self._read_json_body() or {}
-        dry_run = bool(data.get('dry_run', False))
-        with_reflection = bool(data.get('with_reflection', False))
-        result = _memory_gc_run(
-            os.getcwd(), dry_run=dry_run, with_reflection=with_reflection,
-        )
-        self._send_json(result)
-
-    def _handle_memory_gc_prune(self) -> None:
-        """POST /api/memory/gc/prune-archive — body {"apply": bool}"""
-        data = self._read_json_body() or {}
-        apply = bool(data.get('apply', False))
-        result = _memory_gc_prune_archive(os.getcwd(), apply=apply)
-        self._send_json(result)
-
-    # ---------------- Kanban DnD POST handler ----------------
-
-    def _handle_kanban_move(self) -> None:
-        """POST /api/kanban/move — body {"ticket": "T-NNN", "to": "todo"|"open"}.
-
-        칸반 보드 DnD 로 To Do ↔ Open 전이만 허용한다 (안전 DnD 정책).
-        다른 전이 (In Progress / Review / Done) 는 부수 효과를 동반하므로
-        명시적 명령 (/wf -s, /wf -d) 으로만 가능.
-
-        내부적으로 `flow-kanban move T-NNN <to>` 를 호출하여 FSM 검증 + 파일 이동
-        + 로그 기록까지 위임한다.
-        """
-        import subprocess
-
-        data = self._read_json_body() or {}
-        ticket = (data.get('ticket') or '').strip()
-        to = (data.get('to') or '').strip().lower()
-
-        # 입력 검증
-        if not ticket or not ticket.startswith('T-'):
-            self._send_error(400, 'Missing or invalid "ticket" (T-NNN required)')
-            return
-        if to not in ('todo', 'open'):
-            self._send_error(400, 'DnD allows only To Do ↔ Open transitions ("to" must be "todo" or "open")')
-            return
-
-        # flow-kanban move 호출 (FSM 검증 + 파일 이동 + 로그)
-        project_root = os.getcwd()
-        flow_kanban = os.path.join(project_root, '.claude-organic', 'bin', 'flow-kanban')
-        try:
-            result = subprocess.run(
-                [flow_kanban, 'move', ticket, to],
-                cwd=project_root,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-        except subprocess.TimeoutExpired:
-            self._send_error(504, 'flow-kanban move timed out')
-            return
-        except FileNotFoundError:
-            self._send_error(500, f'flow-kanban not found: {flow_kanban}')
-            return
-
-        if result.returncode != 0:
-            stderr = (result.stderr or result.stdout or '').strip()
-            self._send_error(400, f'flow-kanban move failed: {stderr}')
-            return
-
-        self._send_json({
-            'ok': True,
-            'ticket': ticket,
-            'to': to,
-            'stdout': result.stdout.strip(),
-        })
-
-    def _handle_kanban_submit(self) -> None:
-        """POST /api/kanban/submit — body {"ticket": "T-NNN", "command": "implement|research|review"}.
-
-        프론트 DnD Open → In Progress drop confirm 모달의 [실행] 버튼이
-        호출하는 단일 진입점. launcher 가 ① progress 이동 ② command 정규화
-        ③ LLM spawn 을 모두 흡수하므로 핸들러는 위임만 담당한다 (T-399).
-
-        응답: {ok: bool, mode: "launched"|"inline"|"error",
-               session_id?: str, message: str}
-        """
-        import re
-        import subprocess
-
-        data = self._read_json_body() or {}
-        ticket = (data.get('ticket') or '').strip()
-        command = (data.get('command') or '').strip()
-
-        # 입력 검증
-        if not ticket or not re.match(r'^T-\d+$', ticket):
-            self._send_error(400, 'Missing or invalid "ticket" (T-NNN required)')
-            return
-        if command not in ('implement', 'research', 'review'):
-            self._send_error(400, 'Invalid "command" (must be implement/research/review)')
-            return
-
-        # flow-launcher launch 호출 — launcher 가 ① progress 이동 ② command 정규화
-        # ③ LLM spawn 을 모두 처리한다.
-        project_root = os.getcwd()
-        flow_launcher = os.path.join(project_root, '.claude-organic', 'bin', 'flow-launcher')
-        try:
-            result = subprocess.run(
-                [flow_launcher, 'launch', ticket, command],
-                cwd=project_root,
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-        except subprocess.TimeoutExpired:
-            self._send_error(504, 'flow-launcher launch timed out')
-            return
-        except FileNotFoundError:
-            self._send_error(500, f'flow-launcher not found: {flow_launcher}')
-            return
-
-        if result.returncode != 0:
-            stderr = (result.stderr or result.stdout or '').strip()
-            self._send_error(400, f'flow-launcher launch failed: {stderr}')
-            return
-
-        # stdout prefix 파싱: LAUNCH:/INLINE:
-        stdout = result.stdout.strip()
-        first_line = stdout.split('\n', 1)[0].strip() if stdout else ''
-        if first_line.startswith('LAUNCH:'):
-            # "LAUNCH: <session_id> 실행 중" 형태에서 session_id 추출
-            mode = 'launched'
-            tail = first_line[len('LAUNCH:'):].strip()
-            session_id = tail.split()[0] if tail else ''
-            payload = {
-                'ok': True,
-                'mode': mode,
-                'ticket': ticket,
-                'session_id': session_id,
-                'message': first_line,
-            }
-        elif first_line.startswith('INLINE:'):
-            mode = 'inline'
-            payload = {
-                'ok': True,
-                'mode': mode,
-                'ticket': ticket,
-                'message': first_line,
-            }
-        else:
-            payload = {
-                'ok': True,
-                'mode': 'unknown',
-                'ticket': ticket,
-                'message': first_line or 'no stdout',
-            }
-        self._send_json(payload)
-
     def _handle_poll(self) -> None:
-        """폴링 엔드포인트를 처리한다.
-
-        마지막 폴링 이후 변경된 이벤트 타입 목록을 JSON으로 응답한다.
-        """
+        """폴링 엔드포인트를 처리한다."""
         changes = poll_tracker.flush()
-        body = json.dumps(changes).encode('utf-8')
+        body = json.dumps(changes).encode("utf-8")
         self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Cache-Control', 'no-cache')
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
 
     def _handle_sse(self) -> None:
-        """SSE 엔드포인트를 처리한다.
-
-        연결을 유지하며 FileWatcher의 이벤트를 클라이언트에 스트리밍한다.
-        """
+        """SSE 엔드포인트를 처리한다."""
         self.send_response(200)
-        self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
-        self.send_header('Cache-Control', 'no-cache')
-        self.send_header('Connection', 'keep-alive')
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
-        # 연결 확인용 초기 주석 전송
         try:
-            self.wfile.write(b': connected\n\n')
+            self.wfile.write(b": connected\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             return
 
         sse_manager.add(self.wfile)
         try:
-            # 연결이 유지되는 동안 대기
             while True:
                 time.sleep(1)
-                # keep-alive 주석 전송으로 연결 상태 확인
                 client_lock = sse_manager.get_lock(self.wfile)
                 if client_lock is None:
                     break
                 try:
                     with client_lock:
-                        self.wfile.write(b': heartbeat\n\n')
+                        self.wfile.write(b": heartbeat\n\n")
                         self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     break
